@@ -73,8 +73,31 @@ def save_result(filename, content):
 
 
 def page_is_ready(page):
+    """判断页面是否真正加载完成 (不是CF challenge页)"""
     try:
-        return len(page.html) > 10000
+        html = page.html
+        if len(html) < 5000:
+            return False
+        html_lower = html.lower()
+        # CF challenge 页面的特征 - 如果有这些就说明还没过
+        cf_signs = [
+            'challenges.cloudflare.com',
+            'cf-turnstile',
+            'just a moment',
+            'checking your browser',
+            'cf_chl_opt',
+            'ray id',
+        ]
+        for sign in cf_signs:
+            if sign in html_lower:
+                return False
+        # 确认是花云真正的页面
+        if 'clientarea' in html_lower or 'logout.php' in html_lower or 'inputemail' in html_lower:
+            return True
+        # 如果内容够长且没有CF特征，也认为就绪
+        if len(html) > 15000:
+            return True
+        return False
     except Exception:
         return False
 
@@ -377,18 +400,44 @@ class WindowWorker:
             return False
         try:
             self.page.get(TARGET_PAGE)
-            time.sleep(3)
+            time.sleep(5)  # 给页面更多加载时间
 
             if is_banned(self.page):
                 self.log("此IP已被封")
                 return False
 
-            # 使用内置 CDP 过盾 (不需要插件!)
+            # 检查是否需要过盾
             if not page_is_ready(self.page):
-                self.log("等待过盾 (内置CDP)...")
-                if not wait_cf_pass(self.page, max_wait=CF_WAIT_MAX, log_func=self.log):
-                    self.log("过盾失败")
-                    return False
+                # 检查是否是 CF challenge
+                html_lower = self.page.html.lower() if self.page.html else ''
+                if 'challenges.cloudflare.com' in html_lower or 'just a moment' in html_lower or 'cf-turnstile' in html_lower:
+                    self.log("检测到 CF Turnstile, 尝试过盾...")
+                    if not wait_cf_pass(self.page, max_wait=CF_WAIT_MAX, log_func=self.log):
+                        self.log("过盾失败")
+                        return False
+                else:
+                    # 可能是代理连不上或者页面还在加载
+                    self.log("页面未就绪, 等待中...")
+                    start = time.time()
+                    while time.time() - start < 30:
+                        time.sleep(3)
+                        if page_is_ready(self.page):
+                            break
+                        if is_banned(self.page):
+                            self.log("此IP已被封")
+                            return False
+                        # 再检查一次是否出现了 CF challenge
+                        html_lower = self.page.html.lower() if self.page.html else ''
+                        if 'challenges.cloudflare.com' in html_lower or 'cf-turnstile' in html_lower:
+                            self.log("检测到 CF Turnstile, 尝试过盾...")
+                            if wait_cf_pass(self.page, max_wait=CF_WAIT_MAX, log_func=self.log):
+                                break
+                            else:
+                                return False
+                    
+                    if not page_is_ready(self.page):
+                        self.log("等待超时, 页面未就绪")
+                        return False
 
             if is_logged_in(self.page):
                 logout_force(self.page)
@@ -396,6 +445,12 @@ class WindowWorker:
 
             if has_login_form(self.page) or reload_form_silent(self.page):
                 self.log("页面就绪, 可以开始登录 ✓")
+                return True
+
+            # 最后尝试: 可能页面加载了但DOM不同
+            time.sleep(3)
+            if has_login_form(self.page) or reload_form_silent(self.page):
+                self.log("页面就绪 (延迟加载), 可以开始登录 ✓")
                 return True
 
             self.log("无法获取登录表单")

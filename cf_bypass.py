@@ -531,23 +531,40 @@ def wait_and_solve_cf(page, max_wait=60, log_func=None):
             html = page.html
             html_lower = html.lower()
             
-            # 已经加载完成 (有登录表单或已登录)
-            if len(html) > 10000:
-                return True
-            
             # 被封了
             if len(html) < 3000:
                 if '403 forbidden' in html_lower or '429' in html_lower:
                     log("[过盾] 检测到封禁")
                     return False
             
-            # 检查是否有 CF challenge
-            if is_cf_challenge_present(page):
+            # 检查是否有真正的页面内容 (不是 CF challenge)
+            cf_signs = ['challenges.cloudflare.com', 'cf-turnstile', 'just a moment',
+                        'checking your browser', 'cf_chl_opt']
+            has_cf = any(sign in html_lower for sign in cf_signs)
+            
+            # 已经加载完成 (有花云页面特征且没有CF特征)
+            if not has_cf and len(html) > 10000:
+                if 'clientarea' in html_lower or 'logout.php' in html_lower or 'inputemail' in html_lower:
+                    return True
+            
+            # 内容够长且没CF特征
+            if not has_cf and len(html) > 15000:
+                return True
+            
+            # 检查是否有 CF challenge iframe (需要点击)
+            if has_cf or is_cf_challenge_present(page):
                 log("[过盾] 检测到 Turnstile, 尝试自动点击...")
-                solved = solve_turnstile(page, max_attempts=3, max_wait=30)
+                solved = solve_turnstile(page, max_attempts=3, max_wait=min(30, max_wait - (time.time() - start)))
                 if solved:
                     log("[过盾] Turnstile 已通过 ✓")
                     time.sleep(2)
+                    # 验证一下
+                    new_html = page.html.lower()
+                    new_has_cf = any(sign in new_html for sign in cf_signs)
+                    if not new_has_cf and len(page.html) > 10000:
+                        return True
+                    # 可能还在跳转，再等等
+                    time.sleep(3)
                     return True
                 else:
                     log("[过盾] 点击后未通过, 继续等待...")
@@ -559,7 +576,10 @@ def wait_and_solve_cf(page, max_wait=60, log_func=None):
     
     # 超时了，检查最终状态
     try:
-        if len(page.html) > 10000:
+        html = page.html
+        html_lower = html.lower()
+        cf_signs = ['challenges.cloudflare.com', 'cf-turnstile', 'just a moment']
+        if not any(sign in html_lower for sign in cf_signs) and len(html) > 10000:
             return True
     except Exception:
         pass
