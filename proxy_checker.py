@@ -379,3 +379,13 @@ if __name__ == "__main__":
     print(f"\n[*] 检测完成: {len(alive)}/{len(proxies)} 个代理存活")
     for p in alive:
         print(f"  ✓ {p.to_url()} ({p.latency:.0f}ms)")
+
+    # === 保存存活代理到文件 ===
+    if alive:
+        output_file = "alive_proxies.txt"
+        with open(output_file, "w", encoding="utf-8") as f:
+            for p in alive:
+                f.write(f"{p.to_url()}\n")
+        print(f"\n[*] 存活代理已保存到: {os.path.abspath(output_file)} ({len(alive)} 条)")
+    else:
+        print("\n[!] 没有存活代理，未生成文件")
