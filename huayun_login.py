@@ -247,6 +247,7 @@ def precheck_proxy_for_flowercloud(proxy, extension_path, timeout=30):
     2. 过盾插件能加载
     3. 能打开花云登录页
     返回 True/False
+    注意: 不能用headless, 因为headless不支持加载扩展
     """
     port = random.randint(19000, 19999)
     page = None
@@ -257,7 +258,7 @@ def precheck_proxy_for_flowercloud(proxy, extension_path, timeout=30):
         co.set_argument('--disable-gpu')
         co.set_argument('--disable-dev-shm-usage')
         co.set_argument('--no-sandbox')
-        co.set_argument('--headless=new')
+        # 不用headless! headless模式无法加载Chrome扩展插件
 
         if extension_path and os.path.isdir(extension_path):
             co.set_argument(f'--load-extension={extension_path}')
@@ -783,7 +784,7 @@ if HAS_GUI:
                 def update():
                     self.btn_precheck.configure(state="normal", text="预检代理")
                     self.status_lbl.configure(text=f"预检完成: {len(good)}个可用", text_color="#00E676")
-                    self.proxy_var.set("alive_proxies.txt")
+                    # 不自动修改代理路径,让用户自己选
                 self.after(0, update)
 
             self._precheck_running = True
