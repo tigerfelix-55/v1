@@ -761,7 +761,7 @@ if HAS_GUI:
             def run():
                 good = []
                 for i, proxy in enumerate(proxies):
-                    if not self.engine or not getattr(self, '_precheck_running', True):
+                    if not getattr(self, '_precheck_running', True):
                         break
                     self._log(f"  [{i+1}/{len(proxies)}] {proxy.to_url()}...", )
                     ok = precheck_proxy_for_flowercloud(proxy, ext_path)
