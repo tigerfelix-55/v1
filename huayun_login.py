@@ -655,7 +655,7 @@ if HAS_GUI:
             r1 = ctk.CTkFrame(top, fg_color="transparent")
             r1.pack(fill="x", padx=10, pady=4)
             ctk.CTkLabel(r1, text="代理文件:").pack(side="left")
-            self.proxy_var = ctk.StringVar(value="alive_proxies.txt")
+            self.proxy_var = ctk.StringVar(value="")
             ctk.CTkEntry(r1, textvariable=self.proxy_var, width=200).pack(side="left", padx=5)
             ctk.CTkButton(r1, text="浏览", width=50, command=self._pick_proxy).pack(side="left", padx=(0, 15))
             ctk.CTkLabel(r1, text="Combo:").pack(side="left")
