@@ -280,14 +280,12 @@ class WindowWorker:
             co.set_argument('--disable-gpu')
             co.set_argument('--disable-dev-shm-usage')
             co.set_argument('--no-sandbox')
-            co.set_argument('--disable-background-networking')
             co.set_argument('--disable-sync')
             co.set_argument('--disable-translate')
 
-            # 加载过盾插件
+            # 加载过盾插件 (关键: 只用 --load-extension, 不加任何disable-extensions参数)
             if self.extension_path and os.path.isdir(self.extension_path):
                 co.set_argument(f'--load-extension={self.extension_path}')
-                co.set_argument(f'--disable-extensions-except={self.extension_path}')
 
             # 设置代理
             if proxy:
@@ -308,29 +306,6 @@ class WindowWorker:
             pass
         self.page = None
         gc.collect()
-
-    def verify_extension_loaded(self):
-        """验证过盾插件已加载"""
-        if not self.extension_path:
-            return True  # 没有插件则跳过验证
-        try:
-            # 检查 chrome://extensions 或通过页面行为判断
-            self.page.get("chrome://extensions/")
-            time.sleep(2)
-            html = self.page.html
-            # 如果插件目录名出现在extensions页就算加载成功
-            ext_name = os.path.basename(self.extension_path)
-            if ext_name.lower() in html.lower() or "已启用" in html or "enabled" in html.lower():
-                self.log("过盾插件已加载 ✓")
-                return True
-            # 备用: 检查是否有任何扩展
-            if "extension" in html.lower() and len(html) > 1000:
-                self.log("检测到扩展已加载 ✓")
-                return True
-            self.log("警告: 未确认插件加载,继续尝试...")
-            return True  # 不阻塞,继续尝试
-        except Exception:
-            return True  # 出错也继续
 
     def init_page_and_verify(self):
         """打开花云页面, 等过盾, 验证能正常登录"""
@@ -376,10 +351,7 @@ class WindowWorker:
         if not self.start_browser_with_proxy(proxy):
             return self.switch_to_next_ip()  # 递归尝试下一个
 
-        # 验证插件
-        self.verify_extension_loaded()
-
-        # 验证能打开花云
+        # 直接打开花云验证: 能过盾+看到登录表单 = IP有效
         if not self.init_page_and_verify():
             self.log(f"代理 {proxy.to_url()} 无法访问花云,换下一个")
             self.close_browser()
