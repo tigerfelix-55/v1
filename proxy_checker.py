@@ -374,7 +374,7 @@ if __name__ == "__main__":
         latency_str = f" ({proxy.latency:.0f}ms)" if proxy.alive else ""
         print(f"  [{checked[0]}/{total}] {proxy.to_url()} -> {status}{latency_str}")
 
-    alive = check_proxies_batch(proxies, max_workers=30, timeout=10, callback=on_checked)
+    alive = check_proxies_batch(proxies, max_workers=100, timeout=5, callback=on_checked)
 
     print(f"\n[*] 检测完成: {len(alive)}/{len(proxies)} 个代理存活")
     for p in alive:
