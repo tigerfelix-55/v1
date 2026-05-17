@@ -54,39 +54,53 @@ def parse_proxy_line(line: str) -> Optional[Proxy]:
     if not line or line.startswith("#"):
         return None
 
+    # 去除可能的引号包裹
+    line = line.strip('"').strip("'")
+
     protocol = "http"
     auth_user = None
     auth_pass = None
 
-    # 提取协议前缀
-    proto_match = re.match(r'^(socks4|socks5|https?|SOCKS4|SOCKS5|HTTPS?|HTTP?)://', line, re.IGNORECASE)
+    # 提取协议前缀 (支持大小写混合)
+    proto_match = re.match(r'^(socks4|socks5|https?|SOCKS4|SOCKS5|HTTPS?|HTTP?|Socks4|Socks5)://', line, re.IGNORECASE)
     if proto_match:
         protocol = proto_match.group(1).lower()
+        # 标准化 http 变体
+        if protocol in ("http", "https"):
+            pass
         line = line[proto_match.end():]
 
-    # 提取认证信息
+    # 去除行内可能的空格
+    line = line.strip()
+
+    # 提取认证信息 (user:pass@host:port)
     if "@" in line:
-        auth_part, host_part = line.rsplit("@", 1)
+        at_idx = line.rfind("@")
+        auth_part = line[:at_idx]
+        host_part = line[at_idx + 1:]
         if ":" in auth_part:
             auth_user, auth_pass = auth_part.split(":", 1)
-        else:
-            auth_user = auth_part
-            host_part = line  # fallback
-            auth_user = None
-        line = host_part if auth_user else line
+        line = host_part
 
-    # 提取 host:port
-    match = re.match(r'^([^:]+):(\d+)$', line)
+    # 提取 host:port - 支持 IPv4 和域名
+    # 兼容末尾可能有空格或其他字符
+    match = re.match(r'^([a-zA-Z0-9._\-]+):(\d+)\s*$', line)
+    if not match:
+        # 尝试更宽松的匹配
+        match = re.match(r'^([^:]+):(\d+)', line)
     if not match:
         return None
 
-    host = match.group(1)
+    host = match.group(1).strip()
     try:
-        port = int(match.group(2))
+        port = int(match.group(2).strip())
     except ValueError:
         return None
 
     if port < 1 or port > 65535:
+        return None
+
+    if not host:
         return None
 
     return Proxy(
@@ -102,11 +116,40 @@ def load_proxies_from_file(filepath: str) -> List[Proxy]:
     """从文件加载代理列表"""
     proxies = []
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            for line in f:
-                proxy = parse_proxy_line(line)
-                if proxy:
-                    proxies.append(proxy)
+        # 尝试多种编码读取，处理 BOM
+        content = None
+        for encoding in ["utf-8-sig", "utf-8", "gbk", "latin-1"]:
+            try:
+                with open(filepath, "r", encoding=encoding) as f:
+                    content = f.read()
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+
+        if content is None:
+            print(f"[错误] 无法读取代理文件: {filepath}")
+            return proxies
+
+        lines = content.splitlines()
+        failed_lines = []
+        for i, line in enumerate(lines, 1):
+            # 去除所有不可见字符、空格、\r\n
+            line = line.strip().replace('\r', '').replace('\n', '').replace('\t', '')
+            # 去除零宽字符
+            line = re.sub(r'[\u200b\u200c\u200d\ufeff\u00a0]', '', line)
+            if not line:
+                continue
+            proxy = parse_proxy_line(line)
+            if proxy:
+                proxies.append(proxy)
+            else:
+                failed_lines.append((i, line[:60]))
+
+        if failed_lines and len(failed_lines) <= 10:
+            print(f"[警告] 以下行解析失败:")
+            for ln, text in failed_lines:
+                print(f"  第{ln}行: '{text}'")
+
     except FileNotFoundError:
         print(f"[错误] 代理文件未找到: {filepath}")
     except Exception as e:
