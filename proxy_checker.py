@@ -306,17 +306,61 @@ def check_proxies_batch(
 # ============ 命令行独立运行 ============
 if __name__ == "__main__":
     import sys
+    import os
 
     filepath = "proxies.txt"
     if len(sys.argv) > 1:
         filepath = sys.argv[1]
 
-    print(f"[*] 加载代理文件: {filepath}")
+    # === 诊断信息 ===
+    print(f"[*] 当前工作目录: {os.getcwd()}")
+    print(f"[*] 脚本所在目录: {os.path.dirname(os.path.abspath(__file__))}")
+    print(f"[*] 代理文件路径: {filepath}")
+    abs_path = os.path.abspath(filepath)
+    print(f"[*] 绝对路径: {abs_path}")
+    print(f"[*] 文件是否存在: {os.path.exists(abs_path)}")
+
+    if not os.path.exists(abs_path):
+        # 尝试在脚本同目录下查找
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        alt_path = os.path.join(script_dir, "proxies.txt")
+        print(f"[*] 尝试脚本同目录: {alt_path}")
+        if os.path.exists(alt_path):
+            filepath = alt_path
+            print(f"[*] 找到! 使用: {filepath}")
+        else:
+            # 列出当前目录的txt文件
+            print(f"[*] 当前目录下的 .txt 文件:")
+            for f in os.listdir(os.getcwd()):
+                if f.endswith('.txt'):
+                    print(f"    - {f}")
+            print(f"[*] 脚本目录下的 .txt 文件:")
+            for f in os.listdir(script_dir):
+                if f.endswith('.txt'):
+                    print(f"    - {f}")
+
+    print(f"\n[*] 加载代理文件: {filepath}")
+
+    # 先显示文件前3行原始内容（诊断编码问题）
+    if os.path.exists(filepath):
+        print(f"[*] 文件大小: {os.path.getsize(filepath)} 字节")
+        with open(filepath, "rb") as f:
+            raw = f.read(200)
+            print(f"[*] 文件前200字节(hex): {raw[:50].hex()}")
+            print(f"[*] 文件前3行原始内容:")
+            lines_raw = raw.decode("utf-8", errors="replace").split("\n")[:3]
+            for j, l in enumerate(lines_raw, 1):
+                print(f"    第{j}行: [{repr(l)}]")
+
     proxies = load_proxies_from_file(filepath)
     print(f"[*] 共加载 {len(proxies)} 个代理")
 
     if not proxies:
         print("[!] 没有可用代理")
+        print("[!] 请确认:")
+        print("    1. proxies.txt 和 proxy_checker.py 在同一目录")
+        print("    2. 文件格式为每行一个: socks5://IP:端口")
+        print("    3. 文件编码为 UTF-8 (不是 UTF-16)")
         sys.exit(1)
 
     print("[*] 开始存活检测...")
