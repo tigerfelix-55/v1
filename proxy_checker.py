@@ -61,13 +61,15 @@ def parse_proxy_line(line: str) -> Optional[Proxy]:
     auth_user = None
     auth_pass = None
 
-    # 提取协议前缀 (支持大小写混合)
-    proto_match = re.match(r'^(socks4|socks5|https?|SOCKS4|SOCKS5|HTTPS?|HTTP?|Socks4|Socks5)://', line, re.IGNORECASE)
+    # 提取协议前缀 (支持大小写混合，兼容 sock5/sock4 少写s的情况)
+    proto_match = re.match(r'^(socks?4|socks?5|https?|SOCKS?4|SOCKS?5|HTTPS?|HTTP?)://', line, re.IGNORECASE)
     if proto_match:
         protocol = proto_match.group(1).lower()
-        # 标准化 http 变体
-        if protocol in ("http", "https"):
-            pass
+        # 标准化: sock4->socks4, sock5->socks5
+        if protocol == "sock5":
+            protocol = "socks5"
+        elif protocol == "sock4":
+            protocol = "socks4"
         line = line[proto_match.end():]
 
     # 去除行内可能的空格
