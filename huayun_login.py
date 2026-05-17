@@ -237,60 +237,6 @@ class ProxyManager:
         return len(self.all_proxies)
 
 
-# ============================================================
-# 代理预检测 - 验证能否打开花云登录页
-# ============================================================
-def precheck_proxy_for_flowercloud(proxy, extension_path, timeout=30):
-    """
-    启动临时Chrome验证:
-    1. 代理能连通
-    2. 过盾插件能加载
-    3. 能打开花云登录页
-    返回 True/False
-    注意: 不能用headless, 因为headless不支持加载扩展
-    """
-    port = random.randint(19000, 19999)
-    page = None
-    try:
-        co = ChromiumOptions()
-        co.set_local_port(port)
-        co.set_argument('--no-first-run')
-        co.set_argument('--disable-gpu')
-        co.set_argument('--disable-dev-shm-usage')
-        co.set_argument('--no-sandbox')
-        # 不用headless! headless模式无法加载Chrome扩展插件
-
-        if extension_path and os.path.isdir(extension_path):
-            co.set_argument(f'--load-extension={extension_path}')
-            co.set_argument(f'--disable-extensions-except={extension_path}')
-
-        proxy_str = proxy.to_selenium_arg()
-        co.set_argument(f'--proxy-server={proxy_str}')
-
-        page = ChromiumPage(co)
-        page.get(TARGET_PAGE)
-        time.sleep(8)
-
-        # 检查是否被封或能加载
-        if is_banned(page):
-            return False
-        if page_is_ready(page) or has_login_form(page):
-            return True
-        # 等过盾
-        if wait_cf_pass(page, timeout):
-            return True
-        return False
-    except Exception:
-        return False
-    finally:
-        try:
-            if page:
-                page.quit()
-        except Exception:
-            pass
-        gc.collect()
-
-
 
 # ============================================================
 # 单窗口Worker
@@ -676,8 +622,6 @@ if HAS_GUI:
             # Row 4: 按钮
             r3 = ctk.CTkFrame(top, fg_color="transparent")
             r3.pack(fill="x", padx=10, pady=4)
-            self.btn_precheck = ctk.CTkButton(r3, text="预检代理", width=100, fg_color="#2196F3", command=self._precheck)
-            self.btn_precheck.pack(side="left", padx=5)
             self.btn_start = ctk.CTkButton(r3, text="开始运行", width=100, fg_color="#4CAF50", command=self._start)
             self.btn_start.pack(side="left", padx=5)
             self.btn_stop = ctk.CTkButton(r3, text="停止", width=80, fg_color="#F44336", command=self._stop)
@@ -846,7 +790,6 @@ if HAS_GUI:
         def _stop(self):
             if self.engine:
                 self.engine.stop()
-            self._precheck_running = False
             self.status_lbl.configure(text="已停止", text_color="#F44336")
             self.btn_start.configure(state="normal")
             self._log("[停止]")
